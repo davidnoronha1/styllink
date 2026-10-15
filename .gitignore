@@ -1,0 +1,20 @@
+# Local builds and caches
+/styllink
+/styllink.o
+/dist/
+/.zig-cache/
+/zig-out/
+/android/build/
+/android/*.apk
+/android/*.apk.idsig
+/android/*.sha256
+
+# Local credentials and runtime data
+/.styllink-token*
+/*.log
+/android/debug.keystore
+/.aws/
+/.deploy/
+
+# Local session handoff
+/CONTINUE.md

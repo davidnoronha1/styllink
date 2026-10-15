@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#000000">
+<title>StylLink</title>
+<style>
+  :root {
+    --bg: #000; --fg: #c9d1d9; --dim: #6b7682; --edge: #2c323b;
+    --ok: #3fb950; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, sans-serif;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    -webkit-touch-callout: none; overscroll-behavior: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+  /* Invisible top-right hot corner; hover (mouse/pen) or tap unfolds the panel. */
+  #hud { position: fixed; top: 0; right: 0; display: flex; flex-direction: column; align-items: flex-end; }
+  #corner { width: 48px; height: 48px; }
+  #panel {
+    display: none; flex-direction: column; gap: 12px; width: 260px; margin: 0 8px 8px 0; padding: 14px;
+    border-radius: 12px; background: #1c2128f5; border: 1px solid var(--edge);
+    box-shadow: 0 8px 24px #0008; touch-action: manipulation;
+  }
+  #hud.open #panel { display: flex; }
+  #status { display: flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); flex: none; }
+  .dot.ok { background: var(--ok); }
+  #panel label { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-height: 28px; }
+  #panel input { width: 22px; height: 22px; accent-color: #58a6ff; }
+  #panel button {
+    padding: 10px; border-radius: 8px; border: 1px solid var(--edge); background: #2d333b; color: var(--fg); font: inherit;
+  }
+  #panel small { color: var(--dim); }
+  #connForm { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid var(--edge); }
+  #connForm input {
+    width: 150px; height: 32px; padding: 0 8px; border-radius: 6px; border: 1px solid var(--edge);
+    background: #0d1117; color: var(--fg); font: inherit;
+  }
+</style>
+</head>
+<body>
+<canvas id="pad"></canvas>
+<div id="hud">
+  <div id="corner"></div>
+  <div id="panel">
+    <div id="status"><div class="dot" id="dot"></div><span id="stat">connecting…</span></div>
+    <form id="connForm" autocomplete="off">
+      <label>PC address <input id="connHost" placeholder="192.168.0.75:8080" inputmode="url"></label>
+      <label>Token <input id="connToken" placeholder="from the terminal"></label>
+      <button type="submit">Connect</button>
+    </form>
+    <label>Finger drawing <input type="checkbox" id="optFinger"></label>
+    <label>Mouse drawing <input type="checkbox" id="optMouse"></label>
+    <label>Keep screen aspect (adds bars) <input type="checkbox" id="optBox"></label>
+    <label>Ink trail preview <input type="checkbox" id="optTrail"></label>
+    <label>Keep Wi-Fi awake <input type="checkbox" id="optAwake"></label>
+    <button id="btnFs">Fullscreen</button>
+    <button id="btnAndroid" hidden>Open in Android app</button>
+    <small id="info"></small>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const pad = $("pad");
+const ctx = pad.getContext("2d", { desynchronized: true, alpha: false });
+
+// ---------------------------------------------------------------- settings
+// The pad fills the whole tablet by default; letterboxing keeps proportions
+// exact but leaves bars where the tablet and monitor shapes differ.
+const opts = { letterbox: false, trail: true, finger: false, mouse: false, awake: true };
+try { Object.assign(opts, JSON.parse(localStorage.getItem("styllink") || "{}")); } catch {}
+const saveOpts = () => { try { localStorage.setItem("styllink", JSON.stringify(opts)); } catch {} };
+for (const [k, id] of [["finger", "optFinger"], ["mouse", "optMouse"], ["letterbox", "optBox"], ["trail", "optTrail"], ["awake", "optAwake"]]) {
+  const el = $(id);
+  el.checked = opts[k];
+  el.onchange = () => { opts[k] = el.checked; saveOpts(); layout(); sendCaps(); };
+}
+
+// pointerrawupdate delivers samples as soon as they arrive instead of once per
+// frame; Chrome only exposes it in secure contexts (https or localhost).
+const RAW = "onpointerrawupdate" in window;
+// getCoalescedEvents (all samples between frames) is secure-context only too.
+const COALESCED = typeof PointerEvent !== "undefined" && typeof PointerEvent.prototype.getCoalescedEvents === "function";
+$("info").textContent = RAW
+  ? "Raw pointer events: on (lowest latency)."
+  : COALESCED
+    ? "Raw pointer events unavailable: needs a secure origin. Using coalesced events."
+    : "Insecure origin: only one pen sample per frame, so fast strokes get choppy. See the terminal for the fix.";
+
+// ---------------------------------------------------------------- hud
+// Hidden until hovered (mouse/pen, after a short dwell) or tapped. A tap pins
+// it open; tapping the corner again or anywhere on the pad closes it.
+const hud = $("hud");
+let pinned = false, dwell = 0;
+const setOpen = (v) => hud.classList.toggle("open", v);
+hud.addEventListener("pointerenter", (e) => {
+  if (e.pointerType === "touch") return;
+  clearTimeout(dwell);
+  dwell = setTimeout(() => setOpen(true), 250);
+});
+hud.addEventListener("pointerleave", (e) => {
+  if (e.pointerType === "touch") return;
+  clearTimeout(dwell);
+  if (!pinned) setOpen(false);
+});
+$("corner").addEventListener("pointerup", () => { pinned = !pinned; setOpen(pinned); });
+pad.addEventListener("pointerdown", () => { if (pinned) { pinned = false; setOpen(false); } });
+
+// ---------------------------------------------------------------- fullscreen
+async function goFullscreen() {
+  const el = document.documentElement;
+  try {
+    if (el.requestFullscreen) await el.requestFullscreen({ navigationUI: "hide" });
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+  } catch {}
+  try { await navigator.wakeLock?.request("screen"); } catch {}
+}
+// Fullscreen needs a user gesture: take the very first one.
+addEventListener("pointerup", () => { if (!document.fullscreenElement) goFullscreen(); }, { once: true });
+$("btnFs").onclick = goFullscreen;
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") navigator.wakeLock?.request("screen").catch(() => {});
+});
+for (const ev of ["contextmenu", "selectstart", "dragstart", "gesturestart"])
+  document.addEventListener(ev, (e) => e.preventDefault(), { passive: false });
+document.addEventListener("touchstart", (e) => { if (e.target === pad) e.preventDefault(); }, { passive: false });
+
+// ---------------------------------------------------------------- geometry
+let aspect = 16 / 9;                     // target region w/h, sent by the server
+let dpr = 1, region = { x: 0, y: 0, w: 1, h: 1 };
+function layout() {
+  dpr = window.devicePixelRatio || 1;
+  const W = innerWidth, H = innerHeight;
+  pad.width = Math.round(W * dpr); pad.height = Math.round(H * dpr);
+  if (!opts.letterbox) region = { x: 0, y: 0, w: W, h: H };
+  else if (W / H > aspect) { const w = H * aspect; region = { x: (W - w) / 2, y: 0, w, h: H }; }
+  else { const h = W / aspect; region = { x: 0, y: (H - h) / 2, w: W, h }; }
+  dirty = true;
+}
+addEventListener("resize", layout);
+
+// ---------------------------------------------------------------- socket
+// Where the styllink server is. The page works from anywhere (e.g. a static
+// HTTPS host, which unlocks the full-rate pen APIs): the terminal's QR code
+// passes "#h=<ip:port>&t=<token>". The fragment never leaves the browser. When
+// the server itself serves the page, the host defaults to the page's own.
+const params = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
+const conn = { host: params.get("h") || "", token: params.get("t") || "" };
+try {
+  if (conn.host) localStorage.setItem("styllink-conn", JSON.stringify(conn));
+  else Object.assign(conn, JSON.parse(localStorage.getItem("styllink-conn") || "{}"));
+} catch {}
+const servedByStyllink = location.protocol === "http:";
+if (!conn.host && servedByStyllink) { conn.host = location.host; conn.token ||= params.get("t") || ""; }
+if (location.hash) history.replaceState(null, "", location.pathname);   // keep the token out of the address bar
+$("connHost").value = conn.host; $("connToken").value = conn.token;
+$("connForm").onsubmit = (e) => {
+  e.preventDefault();
+  conn.host = $("connHost").value.trim().replace(/^\w+:\/\//, "").replace(/\/.*$/, "");
+  conn.token = $("connToken").value.trim();
+  try { localStorage.setItem("styllink-conn", JSON.stringify(conn)); } catch {}
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+  retry = 300; connect();
+};
+// Use the form values so opening the app also works before pressing Connect.
+$("btnAndroid").hidden = !/Android/i.test(navigator.userAgent);
+$("btnAndroid").onclick = () => {
+  const h = $("connHost").value.trim().replace(/^\w+:\/\//, "").replace(/\/.*$/, "");
+  if (!h) { $("connHost").focus(); return; }
+  const query = new URLSearchParams({ h, t: $("connToken").value.trim() });
+  location.href = `styllink://connect?${query}`;
+};
+let ws = null, rtt = null, retry = 300;
+const online = () => ws && ws.readyState === 1;
+function connect() {
+  if (!conn.host) { status(); pinned = true; setOpen(true); return; }   // ask for the address
+  // Plain ws:// even from an https page: Chrome still allows it to LAN
+  // addresses (after a "local network access" prompt); the server has no TLS.
+  try { ws = new WebSocket(`ws://${conn.host}/ws?t=${encodeURIComponent(conn.token)}`); }
+  catch { ws = null; status(); return; }
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => { retry = 300; status(); sendCaps(); };
+  ws.onmessage = (m) => {
+    const d = m.data;
+    if (typeof d !== "string") return;
+    const k = d[0];
+    if (k === "b" || k === "s") ws.send(d);                 // server's link benchmark ping
+    else if (k === "p") { rtt = performance.now() - parseFloat(d.slice(1)); status(); }
+    else if (k === "{") { const h = JSON.parse(d); aspect = h.w / h.h; layout(); }
+  };
+  ws.onclose = () => { ws = null; rtt = null; status(); setTimeout(connect, retry); retry = Math.min(retry * 2, 3000); };
+}
+function status() {
+  $("dot").classList.toggle("ok", !!online());
+  $("stat").textContent = !conn.host ? "enter the PC address" : !online() ? `disconnected (${conn.host})`
+    : rtt == null ? "connected" : `connected · rtt ${rtt.toFixed(1)} ms`;
+  dirty = true;
+}
+setInterval(() => { if (online()) ws.send("p" + performance.now()); }, 1000);
+function sendCaps() { if (online()) ws.send(`i${+RAW}${+COALESCED}${+opts.awake}${+opts.trail}`); }
+
+// Wi-Fi power saving lets the tablet's radio doze between packets; data then
+// leaves in bunches and the PC's ACKs come back late. A tiny message every
+// 50 ms while the pen is quiet keeps the radio awake (costs some battery).
+let lastSend = 0;
+setInterval(() => {
+  if (opts.awake && online() && performance.now() - lastSend > 45) { ws.send("k"); lastSend = performance.now(); }
+}, 50);
+connect();
+
+// ---------------------------------------------------------------- samples
+// Message: u32 send time (0.1 ms units, for the server's uplink stats), then
+// 10 bytes per sample: u16 x, u16 y, u16 pressure, i8 tiltX, i8 tiltY, u8 flags,
+// u8 age (how long before the send time the pen was there, 0.5 ms units; the
+// server uses it to replay bursts with their original spacing)
+const IN_RANGE = 1, TOUCH = 2, BARREL = 4, ERASER = 8;
+const MAX_BATCH = 64;
+const out = new DataView(new ArrayBuffer(4 + 10 * MAX_BATCH));
+const bytes = new Uint8Array(out.buffer);
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+
+function encode(i, e, inRange, now) {
+  const isPen = e.pointerType === "pen";
+  const touching = isPen ? (e.buttons & 33) !== 0 : e.buttons !== 0;
+  let flags = 0;
+  if (inRange && (isPen || touching)) flags |= IN_RANGE;
+  if (flags && touching) flags |= TOUCH;
+  if (isPen && e.buttons & 2) flags |= BARREL;
+  if (isPen && e.buttons & 32) flags |= ERASER;
+  const p = touching ? (e.pressure > 0 ? e.pressure : 0.5) : 0;
+  const o = 4 + i * 10;
+  out.setUint16(o, Math.round(clamp01((e.clientX - region.x) / region.w) * 65535), true);
+  out.setUint16(o + 2, Math.round(clamp01((e.clientY - region.y) / region.h) * 65535), true);
+  out.setUint16(o + 4, Math.round(clamp01(p) * 65535), true);
+  out.setInt8(o + 6, e.tiltX | 0);
+  out.setInt8(o + 7, e.tiltY | 0);
+  out.setUint8(o + 8, flags);
+  out.setUint8(o + 9, Math.max(0, Math.min(255, Math.round((now - e.timeStamp) * 2))));
+  return flags;
+}
+
+function send(e, inRange) {
+  if (!online()) return;
+  const list = inRange && e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  const evs = list.length ? list.slice(-MAX_BATCH) : [e];
+  let flags = 0;
+  const now = performance.now();
+  for (let i = 0; i < evs.length; i++) flags = encode(i, evs[i], inRange, now);
+  // When the link backs up, drop hover-only updates; ink is never dropped.
+  if (!(flags & TOUCH) && flags & IN_RANGE && ws.bufferedAmount > 512) return;
+  out.setUint32(0, Math.floor(now * 10) >>> 0, true);
+  ws.send(bytes.subarray(0, 4 + evs.length * 10));
+  lastSend = performance.now();
+  if (opts.trail) trail(evs, flags);
+}
+
+// ---------------------------------------------------------------- pointer input
+let activeId = null;
+const accept = (e) =>
+  e.pointerType === "pen" || (e.pointerType === "touch" && opts.finger) || (e.pointerType === "mouse" && opts.mouse);
+
+pad.addEventListener("pointerdown", (e) => {
+  if (!accept(e)) return;
+  if (activeId !== null && activeId !== e.pointerId) return;
+  activeId = e.pointerId;
+  pad.setPointerCapture(e.pointerId);
+  send(e, true);
+});
+const onMove = (e) => {
+  if (!accept(e)) return;
+  if (activeId === null && e.pointerType === "pen") activeId = e.pointerId; // hover entering
+  if (e.pointerId !== activeId) return;
+  send(e, true);
+};
+if (RAW) pad.addEventListener("pointerrawupdate", onMove);
+else pad.addEventListener("pointermove", onMove);
+pad.addEventListener("pointerup", (e) => {
+  if (e.pointerId !== activeId) return;
+  send(e, e.pointerType === "pen");       // pen keeps hovering; touch/mouse leave
+  if (e.pointerType !== "pen") activeId = null;
+  lastPt = null;
+});
+for (const type of ["pointercancel", "pointerleave"]) {
+  pad.addEventListener(type, (e) => {
+    if (e.pointerId !== activeId) return;
+    send(e, false);
+    activeId = null;
+    lastPt = null;
+  });
+}
+
+// ---------------------------------------------------------------- local preview
+// Purely cosmetic: a short fading trail so you can see where the pen is. The
+// pad frame turns red while disconnected, the only status shown when folded.
+const segs = [];
+let lastPt = null, cursor = null, dirty = true;
+function trail(evs, flags) {
+  const now = performance.now();
+  for (const e of evs) {
+    const pt = { x: e.clientX, y: e.clientY };
+    const touching = (flags & TOUCH) !== 0;
+    if (touching && lastPt) segs.push({ a: lastPt, b: pt, w: 1 + 4 * (e.pressure || 0.5), t: now, er: flags & ERASER });
+    lastPt = touching ? pt : null;
+    cursor = flags & IN_RANGE ? pt : null;
+  }
+  if (segs.length > 4000) segs.splice(0, segs.length - 4000);
+  dirty = true;
+}
+const FADE = 900;
+function frame() {
+  const now = performance.now();
+  while (segs.length && now - segs[0].t > FADE) segs.shift();
+  if (dirty || segs.length) {
+    dirty = false;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, innerWidth, innerHeight);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(region.x, region.y, region.w, region.h);
+    ctx.strokeStyle = online() ? "#1a1d22" : "#f8514966";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(region.x + 0.5, region.y + 0.5, region.w - 1, region.h - 1);
+    ctx.lineCap = "round";
+    for (const s of segs) {
+      ctx.globalAlpha = 1 - (now - s.t) / FADE;
+      ctx.strokeStyle = s.er ? "#f85149" : "#e6edf3";
+      ctx.lineWidth = s.w;
+      ctx.beginPath(); ctx.moveTo(s.a.x, s.a.y); ctx.lineTo(s.b.x, s.b.y); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    if (cursor && opts.trail) {
+      ctx.strokeStyle = "#6b7682";
+      ctx.beginPath(); ctx.arc(cursor.x, cursor.y, 6, 0, Math.PI * 2); ctx.stroke();
+      dirty = true;
+      cursor = null;
+    }
+  }
+  requestAnimationFrame(frame);
+}
+layout();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

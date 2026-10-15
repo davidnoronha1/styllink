@@ -1,0 +1,92 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    name: Linux server
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zig-version)" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+      - name: Test server
+        run: zig test -O ReleaseSafe --dep page -Mroot=src/main.zig -Mpage=web/page.zig
+      - name: Build server
+        run: |
+          mkdir -p dist/linux
+          zig build-exe -O ReleaseFast -fstrip -target x86_64-linux \
+            --dep page -Mroot=src/main.zig -Mpage=web/page.zig \
+            -femit-bin=dist/linux/styllink
+      - name: Package server
+        run: |
+          cp run.sh install-uinput-access.sh README.md dist/linux/
+          chmod +x dist/linux/styllink dist/linux/*.sh
+          tar -czf dist/styllink-linux-x86_64.tar.gz -C dist/linux .
+          cd dist
+          sha256sum styllink-linux-x86_64.tar.gz > styllink-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: styllink-linux-x86_64
+          path: |
+            dist/styllink-linux-x86_64.tar.gz
+            dist/styllink-linux-x86_64.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  android:
+    name: Android APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - name: Test WebSocket client
+        run: python3 tests/check_link.py
+      - name: Prepare debug signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          # A persistent optional key allows installing CI builds as updates.
+          # Without it, build.sh generates a fresh development key.
+          rm -f android/debug.keystore
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            umask 077
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/debug.keystore
+          fi
+      - name: Build APK
+        run: ./android/build.sh
+      - name: Verify APK signature
+        run: '"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose android/styllink.apk'
+      - name: Checksum APK
+        working-directory: android
+        run: sha256sum styllink.apk > styllink.apk.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: styllink-android
+          path: |
+            android/styllink.apk
+            android/styllink.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
