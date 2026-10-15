@@ -64,7 +64,7 @@ zig build apk-install       # Builds and installs through ADB.
 ```
 
 [GitHub Actions](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml) builds both packages on each push.
-CI uses a new signing key unless you set `ANDROID_DEBUG_KEYSTORE_BASE64`.
+Set `ANDROID_DEBUG_KEYSTORE_BASE64` to keep the CI signing key stable.
 A different key requires you to uninstall the old app before you install the new APK.
 
 ## Options

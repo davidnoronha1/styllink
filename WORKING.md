@@ -52,10 +52,17 @@ The app's ink trail is a local preview. Its fade setting does not delay pen inpu
 | `zig build test` | Server regression test |
 | `zig build test-link` | Java WebSocket regression tests |
 
-Zig compiles the server and tracks its source dependencies. For the APK, Zig
-calls `android/build.sh` and tracks the output file. Android SDK tools compile
-Java, package resources, and sign the APK. This step runs each time to include
-changes to the SDK or signing key. It does not use Gradle.
+Zig compiles the server and tracks its source dependencies. The APK build also
+runs directly from `build.zig`. Each tool has its own step: `aapt2`, `javac`,
+`jar`, `d8`, `zip`, `zipalign`, and `apksigner`. Zig tracks their input files,
+generated files, and dependencies. Unchanged steps use the cache. There is no
+build shell script or Gradle project.
+
+The build uses `android/debug.keystore` if it exists. Otherwise, it generates
+a development key in the Zig cache. Use `-Dandroid-keystore=PATH` to select a
+saved key. These keys use alias `styllink` and password `android`. Keep a saved
+key if you need APK updates to remain compatible after clearing the cache.
+Use `-Dandroid-sdk=PATH` to select the SDK instead of `ANDROID_HOME`.
 
 Use the compiler version in [.zig-version](.zig-version). The default server
 build uses ReleaseFast. Use `-Dtarget=x86_64-linux` to select the CI target.

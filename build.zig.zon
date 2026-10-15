@@ -13,7 +13,6 @@
         "android/src",
         "android/res",
         "android/AndroidManifest.xml",
-        "android/build.sh",
         "tests",
         "tools",
         "run.sh",

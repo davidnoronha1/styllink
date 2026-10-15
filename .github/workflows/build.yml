@@ -75,7 +75,7 @@ jobs:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
         run: |
           # A persistent optional key allows installing CI builds as updates.
-          # Without it, build.sh generates a fresh development key.
+          # Without it, build.zig generates a development key in the Zig cache.
           rm -f android/debug.keystore
           if [ -n "$KEYSTORE_BASE64" ]; then
             umask 077
