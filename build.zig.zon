@@ -1,0 +1,25 @@
+.{
+    .name = .styllink,
+    .version = "0.1.0",
+    .fingerprint = 0x38dd3d8aaf0894ab, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.18.0-dev.253+16d31ceed",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        ".zig-version",
+        "src",
+        "web",
+        "android/src",
+        "android/res",
+        "android/AndroidManifest.xml",
+        "android/build.sh",
+        "tests",
+        "tools",
+        "run.sh",
+        "install-uinput-access.sh",
+        "README.md",
+        "WORKING.md",
+        "docs",
+    },
+}

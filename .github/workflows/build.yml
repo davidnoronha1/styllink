@@ -26,16 +26,15 @@ jobs:
         with:
           version: ${{ steps.zig-version.outputs.version }}
       - name: Test server
-        run: zig test -O ReleaseSafe --dep page -Mroot=src/main.zig -Mpage=web/page.zig
+        run: zig build test
       - name: Build server
         run: |
           mkdir -p dist/linux
-          zig build-exe -O ReleaseFast -fstrip -target x86_64-linux \
-            --dep page -Mroot=src/main.zig -Mpage=web/page.zig \
-            -femit-bin=dist/linux/styllink
+          zig build -Dtarget=x86_64-linux
+          cp zig-out/bin/styllink dist/linux/styllink
       - name: Package server
         run: |
-          cp run.sh install-uinput-access.sh README.md dist/linux/
+          cp run.sh install-uinput-access.sh README.md WORKING.md .zig-version dist/linux/
           cp -R docs dist/linux/
           chmod +x dist/linux/styllink dist/linux/*.sh
           tar -czf dist/styllink-linux-x86_64.tar.gz -C dist/linux .
@@ -63,8 +62,14 @@ jobs:
       - uses: android-actions/setup-android@v3
         with:
           packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zig-version)" >> "$GITHUB_OUTPUT"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
       - name: Test WebSocket client
-        run: python3 tests/check_link.py
+        run: zig build test-link
       - name: Prepare debug signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}
@@ -77,17 +82,17 @@ jobs:
             printf '%s' "$KEYSTORE_BASE64" | base64 --decode > android/debug.keystore
           fi
       - name: Build APK
-        run: ./android/build.sh
+        run: zig build apk
       - name: Verify APK signature
-        run: '"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose android/styllink.apk'
+        run: '"$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose zig-out/android/styllink.apk'
       - name: Checksum APK
-        working-directory: android
+        working-directory: zig-out/android
         run: sha256sum styllink.apk > styllink.apk.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: styllink-android
           path: |
-            android/styllink.apk
-            android/styllink.apk.sha256
+            zig-out/android/styllink.apk
+            zig-out/android/styllink.apk.sha256
           if-no-files-found: error
           retention-days: 30

@@ -7,11 +7,13 @@ Works through Wi-Fi or USB. Built with Zig and native Android views.
 
 <img src="docs/demo.gif" alt="Drawing on the tablet and Linux PC" width="240">
 
+[How it works](WORKING.md)
+
 ## Install
 
-Download the Linux package and Android APK from a successful
-[Build run](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml).
-Open **Artifacts** at the bottom of the run page.
+Download: [Linux](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11963055735) · [Android APK](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11962136870) · [All builds](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml)
+
+Artifacts expire after 30 days. Open **All builds** for newer downloads.
 
 1. Extract the Linux ZIP, then extract its `.tar.gz` file.
 2. Extract the Android ZIP. Install `styllink.apk` on your tablet.
@@ -48,7 +50,8 @@ For browser input, open the browser link from the terminal in Chrome.
 Use the Zig version in [.zig-version](.zig-version):
 
 ```sh
-./run.sh                    # Builds and starts the Linux server.
+zig build                   # Static Linux binary: zig-out/bin/styllink.
+./run.sh                    # Builds and starts the server.
 ```
 
 For Android, install JDK 21 or later and set `ANDROID_HOME` to your SDK path:
@@ -56,11 +59,11 @@ For Android, install JDK 21 or later and set `ANDROID_HOME` to your SDK path:
 ```sh
 sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
 sdkmanager --licenses
-./android/build.sh          # Creates android/styllink.apk.
-./android/build.sh install  # Builds and installs through ADB.
+zig build apk               # Creates zig-out/android/styllink.apk.
+zig build apk-install       # Builds and installs through ADB.
 ```
 
-[GitHub Actions](.github/workflows/build.yml) builds both packages on each push.
+[GitHub Actions](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml) builds both packages on each push.
 CI uses a new signing key unless you set `ANDROID_DEBUG_KEYSTORE_BASE64`.
 A different key requires you to uninstall the old app before you install the new APK.
 

@@ -1,6 +1,7 @@
 # Local builds and caches
 /styllink
 /styllink.o
+/.styllink-next
 /dist/
 /.zig-cache/
 /zig-out/

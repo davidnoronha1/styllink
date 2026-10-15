@@ -4,6 +4,23 @@
 # build-tools 36.0.0) in $ANDROID_HOME or ~/Android/Sdk, plus a JDK.
 # ./build.sh install   also installs it on the USB-connected tablet.
 set -eu
+INSTALL=false
+OUTPUT=""
+START_DIR=$(pwd)
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    install) INSTALL=true; shift ;;
+    --output)
+      [ "$#" -ge 2 ] || { echo "--output requires a path" >&2; exit 2; }
+      case "$2" in
+        /*) OUTPUT=$2 ;;
+        *) OUTPUT=$START_DIR/$2 ;;
+      esac
+      shift 2
+      ;;
+    *) echo "usage: $0 [install] [--output PATH]" >&2; exit 2 ;;
+  esac
+done
 cd "$(dirname "$0")"
 SDK=${ANDROID_HOME:-$HOME/Android/Sdk}
 BT=$SDK/build-tools/36.0.0
@@ -26,4 +43,8 @@ javac -nowarn -Xlint:-options -source 11 -target 11 -classpath "$AJ" -d build/cl
   --out styllink.apk build/aligned.apk
 echo "built android/styllink.apk ($(du -h styllink.apk | cut -f1))"
 
-if [ "${1:-}" = install ]; then adb install -r styllink.apk; fi
+if [ -n "$OUTPUT" ]; then
+  mkdir -p "$(dirname "$OUTPUT")"
+  cp styllink.apk "$OUTPUT"
+fi
+if [ "$INSTALL" = true ]; then adb install -r styllink.apk; fi

@@ -6,10 +6,16 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -x styllink ] || [ src/main.zig -nt styllink ] || [ src/qr.zig -nt styllink ] || [ web/index.html -nt styllink ]; then
-  echo "building..."
-  zig build-exe -O ReleaseFast -fstrip --dep page -Mroot=src/main.zig -Mpage=web/page.zig -femit-bin=styllink
-  rm -f styllink.o
+# Source checkout: let Zig track all dependencies. Downloaded packages contain
+# only the executable and launch scripts and need no compiler.
+if [ -f build.zig ]; then
+  zig build
+  cp zig-out/bin/styllink .styllink-next
+  chmod +x .styllink-next
+  mv -f .styllink-next styllink
+elif [ ! -x styllink ]; then
+  echo "No server binary or build.zig found." >&2
+  exit 1
 fi
 
 GEO=""
