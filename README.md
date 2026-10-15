@@ -5,6 +5,8 @@ Use your Android tablet as a pen tablet for Linux.
 Supports pressure, tilt, the pen button, and the eraser. Sends pen input only.
 Works through Wi-Fi or USB. Built with Zig and native Android views.
 
+<img src="docs/demo.gif" alt="Drawing on the tablet and Linux PC" width="240">
+
 ## Install
 
 Download the Linux package and Android APK from a successful

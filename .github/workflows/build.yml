@@ -36,6 +36,7 @@ jobs:
       - name: Package server
         run: |
           cp run.sh install-uinput-access.sh README.md dist/linux/
+          cp -R docs dist/linux/
           chmod +x dist/linux/styllink dist/linux/*.sh
           tar -czf dist/styllink-linux-x86_64.tar.gz -C dist/linux .
           cd dist
