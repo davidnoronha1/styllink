@@ -1,6 +1,6 @@
 # How StylLink Works
 
-StylLink turns an Android tablet or browser into a high-performance, low-latency drawing tablet for Linux. It receives high-frequency stylus samples over WebSocket and translates them into native Linux tablet events via `/dev/uinput`.
+StylLink turns an Android tablet or browser into a high-performance, low-latency drawing tablet for Linux. It receives high-frequency stylus samples over WebSocket and translates them into native Linux tablet events via `/dev/uinput`. In the other direction it streams the mapped part of the desktop to the tablet, so the pen draws on the picture of the PC screen.
 
 ```text
 Stylus on Tablet (120–240 Hz)
@@ -165,10 +165,72 @@ Standard Linux tablet input stacks (primarily `libinput`) have hardcoded behavio
 
 ---
 
+## Remote Screen (PC → Tablet)
+
+```text
+X server ── DAMAGE events ──► video thread (own epoll, normal priority)
+   │                              │  dirty 32×32 tiles, capture when the link is free
+   └── MIT-SHM ShmGetImage ◄──────┤  copy only the damaged bands
+                                  │  diff tiles against the last frame
+                                  ▼
+             changed rectangles (LZ4 / raw, BGRX / RGB565)  or  H.264 access units
+                                  │  [WebSocket /video, DSCP AF41, TCP_NODELAY]
+                                  ▼
+       Android: GL texture, front buffer · MediaCodec    Web: canvas · WebCodecs
+                                  │
+                                  └── "a<id>" acknowledgement per shown frame
+```
+
+The screen has its own WebSocket (`/video`) on the same port (so the USB `adb reverse` tunnel covers it) and its own thread. A large frame never sits in front of a pen sample: the pen keeps its socket, its voice-queue DSCP and its `SCHED_FIFO` priority (`--realtime`), and the video thread drops back to normal scheduling.
+
+### Negotiation
+The tablet speaks first with what it can show:
+```text
+hv=1;w=2560;h=1600;hz=120;pix=bgrx,rgb565;enc=lz4,raw;codec=tiles,h264;link=usb[;prefer=h264]
+```
+The server answers with its pick, and may send a new one at any time (followed by a key frame):
+```text
+ccodec=tiles;w=1920;h=1080;pix=bgrx;enc=lz4;scale=1;fps=120;inflight=2;tile=32
+```
+- **Codec**: `tiles` unless H.264 was asked for (`--video-codec h264`, or the tablet's "Prefer H.264"), or `--video-source` is set. The browser offers H.264 only when `VideoDecoder` supports it.
+- **Pixels**: BGRX (true color) over USB, RGB565 (half the bytes) over Wi-Fi. If frames take over 40 ms to be acknowledged in true color, the server switches to RGB565 by itself.
+- **Scale**: half resolution only when the halved picture still covers the tablet's own pixels (USB) or 75% of them (Wi-Fi).
+- **Frame rate**: capture runs at up to twice the tablet's refresh rate, so a change right after a frame still makes the next refresh. `--video-fps` sets a hard cap.
+
+### Damage-Driven Tiles
+- StylLink talks the X11 protocol itself (no Xlib, no libc): DAMAGE on the root window reports changed rectangles, which mark 32×32 tiles dirty. A 250 ms rescan (`--video-poll`) catches anything DAMAGE misses; unchanged tiles still cost nothing.
+- When capture is allowed, `DamageSubtract` is sent first, then one `ShmGetImage` per band of dirty tile rows, all pipelined in one round trip into a shared memory segment (or `GetImage` over the socket when the X server cannot share memory).
+- Damage is coarse (often a whole window), so each dirty tile is compared with what the tablet already shows, after conversion to the stream's pixel format. Only tiles that really changed are sent.
+- Changed tiles merge into rectangles (runs along a row, stacked up to 4 tile rows). Each rectangle is compressed with LZ4 (raw if that is smaller) and written to the socket right away, so the network sends rectangle *n* while the server encodes *n+1* and the tablet decodes *n−1*.
+- Message `T` (little-endian): `'T'`, flags (bit 0 last of frame, bit 1 key frame), encoding (0 raw, 1 LZ4), pixels (0 BGRX, 1 RGB565), u32 frame id, u32 capture time (0.1 ms), u16 x, y, w, h, u32 raw size, then the data.
+
+### Latest Frame Wins
+The tablet acknowledges every frame it shows (`a<id>`). With `inflight` frames unacknowledged (default 2), capture waits. Damage keeps piling up meanwhile, so the next capture takes the current screen and skips the stale frames in between. A slow link drops frame rate instead of building a queue. On an idle link, a pen-sized change goes out within about 0.5 ms (see `zig build test-video`).
+
+### H.264
+- **Encoder (`--video-encoder`, x264 through ffmpeg by default)**: the same damage-driven capture writes BGRX frames to the command's stdin and reads Annex-B from its stdout. ffmpeg keeps one frame inside its pipeline whatever the flags. So after each real frame the server feeds the same picture again until the real one comes out. Those duplicates encode as tiny skip frames, flagged so the tablet decodes them without acknowledging. A key frame restarts the encoder.
+- **Source (`--video-source`)**: a command that captures and encodes on its own, e.g. on Wayland (PipeWire) or a hardware KMS → VAAPI pipeline. Its frames are forwarded as they come.
+- Placeholders `{x} {y} {w} {h} {fps}` are filled in. Access units are split at access unit delimiters, so the encoder must emit them (`aud=1`, or `-bsf:v h264_metadata=aud=insert`). Hardware example:
+  ```sh
+  ./run.sh --video-codec h264 --video-encoder 'ffmpeg -loglevel error -probesize 32 -analyzeduration 0 \
+    -vaapi_device /dev/dri/renderD128 -f rawvideo -pix_fmt bgr0 -video_size {w}x{h} -framerate {fps} -i - \
+    -fps_mode passthrough -vf format=nv12,hwupload -c:v h264_vaapi -bf 0 -g 600 -aud 1 -async_depth 1 \
+    -f h264 -flush_packets 1 -avioflags direct -'
+  ```
+- Message `H`: `'H'`, flags (bit 1 key frame, bit 2 duplicate), 2 reserved bytes, u32 frame id, u32 capture time, u32 encode time (µs), then the access unit.
+
+### Display Side
+- **Android tiles**: the socket thread decodes LZ4 and uploads only the changed rectangles into one texture (`glTexSubImage2D`; BGRX is swizzled in the shader). It draws into a **front-buffer** EGL surface (`EGL_SINGLE_BUFFER` + `EGL_ANDROID_front_buffer_auto_refresh`), touching only the changed area. Without that, it uses unthrottled swaps (interval 0). The surface buffer is exactly the stream size, so the display hardware scales it for free.
+- **Android H.264**: MediaCodec decodes straight to the surface, preferring hardware decoders with `FEATURE_LowLatency`, with `KEY_LOW_LATENCY` and realtime priority. Each picture is released for display as soon as it is decoded.
+- **Pen mapping**: the picture is letterboxed to the PC's shape and pen coordinates are taken relative to it, so the stroke lands under the tip. The activity also asks for the display's fastest refresh mode.
+- **Browser**: `putImageData` per rectangle on a desynchronized canvas, or WebCodecs with `optimizeForLatency`.
+
+---
+
 ## Live Diagnostics & Telemetry
 
 StylLink continuously monitors network health without introducing measurement overhead:
 - **RTT Pings**: Sends an initial burst of 50 pings upon connection, followed by periodic pings every 250 ms to compute minimum, median, and 95th percentile RTT.
 - **Uplink Delay Variation**: Compares tablet transmission timestamps against arrival times to measure tablet-to-PC latency spikes.
 - **Linux TCP Telemetry**: Periodically inspects `TCP_INFO` via `getsockopt` to track TCP retransmits and out-of-order packet arrivals (`tcpi_rcv_ooopack`), isolating network packet drops from tablet CPU stalls.
-- **JSON-Lines Logging (`--log PATH`)**: Records structured event logs (`connect`, `caps`, `bench`, `stall`, `stat`, `disconnect`) for network performance analysis using `tools/analyze-wifi.py`.
+- **JSON-Lines Logging (`--log PATH`)**: Records structured event logs (`connect`, `caps`, `bench`, `stall`, `stat`, `disconnect`) for network performance analysis using `tools/analyze-wifi.py`. The screen adds `video` (the negotiated format) and per-second `vstat` lines: frames, rectangles, bytes sent versus raw, capture-to-acknowledge latency, and encode time.

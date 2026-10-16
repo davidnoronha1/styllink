@@ -20,6 +20,7 @@
     -webkit-touch-callout: none; overscroll-behavior: none;
   }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #screen { inset: auto; image-rendering: pixelated; pointer-events: none; }
 
   /* Invisible top-right hot corner; hover (mouse/pen) or tap unfolds the panel. */
   #hud { position: fixed; top: 0; right: 0; display: flex; flex-direction: column; align-items: flex-end; }
@@ -47,6 +48,7 @@
 </style>
 </head>
 <body>
+<canvas id="screen" hidden></canvas>
 <canvas id="pad"></canvas>
 <div id="hud">
   <div id="corner"></div>
@@ -61,6 +63,8 @@
     <label>Mouse drawing <input type="checkbox" id="optMouse"></label>
     <label>Keep screen aspect (adds bars) <input type="checkbox" id="optBox"></label>
     <label>Ink trail preview <input type="checkbox" id="optTrail"></label>
+    <label>Show PC screen <input type="checkbox" id="optScreen"></label>
+    <label>Prefer H.264 screen <input type="checkbox" id="optH264"></label>
     <label>Keep Wi-Fi awake <input type="checkbox" id="optAwake"></label>
     <button id="btnFs">Fullscreen</button>
     <button id="btnAndroid" hidden>Open in Android app</button>
@@ -71,18 +75,21 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const pad = $("pad");
-const ctx = pad.getContext("2d", { desynchronized: true, alpha: false });
+const ctx = pad.getContext("2d", { desynchronized: true });
 
 // ---------------------------------------------------------------- settings
 // The pad fills the whole tablet by default; letterboxing keeps proportions
 // exact but leaves bars where the tablet and monitor shapes differ.
-const opts = { letterbox: false, trail: true, finger: false, mouse: false, awake: true };
+const opts = { letterbox: false, trail: true, finger: false, mouse: false, awake: true, screen: true, h264: false };
 try { Object.assign(opts, JSON.parse(localStorage.getItem("styllink") || "{}")); } catch {}
 const saveOpts = () => { try { localStorage.setItem("styllink", JSON.stringify(opts)); } catch {} };
-for (const [k, id] of [["finger", "optFinger"], ["mouse", "optMouse"], ["letterbox", "optBox"], ["trail", "optTrail"], ["awake", "optAwake"]]) {
+for (const [k, id] of [["finger", "optFinger"], ["mouse", "optMouse"], ["letterbox", "optBox"], ["trail", "optTrail"], ["awake", "optAwake"], ["screen", "optScreen"], ["h264", "optH264"]]) {
   const el = $(id);
   el.checked = opts[k];
-  el.onchange = () => { opts[k] = el.checked; saveOpts(); layout(); sendCaps(); };
+  el.onchange = () => {
+    opts[k] = el.checked; saveOpts(); layout(); sendCaps();
+    if (k === "screen" || k === "h264") restartScreen();
+  };
 }
 
 // pointerrawupdate delivers samples as soon as they arrive instead of once per
@@ -141,9 +148,14 @@ function layout() {
   dpr = window.devicePixelRatio || 1;
   const W = innerWidth, H = innerHeight;
   pad.width = Math.round(W * dpr); pad.height = Math.round(H * dpr);
-  if (!opts.letterbox) region = { x: 0, y: 0, w: W, h: H };
-  else if (W / H > aspect) { const w = H * aspect; region = { x: (W - w) / 2, y: 0, w, h: H }; }
-  else { const h = W / aspect; region = { x: 0, y: (H - h) / 2, w: W, h }; }
+  // The PC screen is always shown in its own shape; the pen maps onto it.
+  const a = scr.on ? scr.w / scr.h : aspect;
+  if (!opts.letterbox && !scr.on) region = { x: 0, y: 0, w: W, h: H };
+  else if (W / H > a) { const w = H * a; region = { x: (W - w) / 2, y: 0, w, h: H }; }
+  else { const h = W / a; region = { x: 0, y: (H - h) / 2, w: W, h }; }
+  const sc = $("screen");
+  sc.hidden = !scr.on;
+  Object.assign(sc.style, { left: region.x + "px", top: region.y + "px", width: region.w + "px", height: region.h + "px" });
   dirty = true;
 }
 addEventListener("resize", layout);
@@ -169,7 +181,7 @@ $("connForm").onsubmit = (e) => {
   conn.token = $("connToken").value.trim();
   try { localStorage.setItem("styllink-conn", JSON.stringify(conn)); } catch {}
   if (ws) { ws.onclose = null; ws.close(); ws = null; }
-  retry = 300; connect();
+  retry = 300; connect(); restartScreen();
 };
 // Use the form values so opening the app also works before pressing Connect.
 $("btnAndroid").hidden = !/Android/i.test(navigator.userAgent);
@@ -216,6 +228,138 @@ setInterval(() => {
   if (opts.awake && online() && performance.now() - lastSend > 45) { ws.send("k"); lastSend = performance.now(); }
 }, 50);
 connect();
+
+// ---------------------------------------------------------------- PC screen
+// A second socket, /video. We tell the server what we can show; it answers
+// with the format ("c") and then sends either changed rectangles ("T": LZ4
+// or raw, BGRX or RGB565) or H.264 access units ("H", via WebCodecs). Each
+// shown frame is acknowledged so the server never runs ahead of us.
+const scr = { on: false, w: 16, h: 9, ws: null, retry: 300, ctx: null, codec: "", dec: null, dup: new Set(), hz: 60, h264: false };
+// Offer H.264 only if this browser really decodes it (open builds don't).
+if (typeof VideoDecoder === "function")
+  Promise.all(["avc1.42e01f", "avc1.640028"].map((codec) => VideoDecoder.isConfigSupported({ codec }).then((r) => r.supported, () => false)))
+    .then((ok) => { scr.h264 = ok.some(Boolean); });
+function lz4(src, dst) {
+  let ip = 0, op = 0;
+  while (ip < src.length) {
+    const token = src[ip++];
+    let lit = token >> 4;
+    if (lit === 15) { let b; do { b = src[ip++]; lit += b; } while (b === 255); }
+    dst.set(src.subarray(ip, ip + lit), op); ip += lit; op += lit;
+    if (ip >= src.length) break;
+    const off = src[ip] | src[ip + 1] << 8; ip += 2;
+    let ml = token & 15;
+    if (ml === 15) { let b; do { b = src[ip++]; ml += b; } while (b === 255); }
+    ml += 4;
+    if (off >= ml) dst.copyWithin(op, op - off, op - off + ml);
+    else for (let i = 0; i < ml; i++) dst[op + i] = dst[op + i - off];
+    op += ml;
+  }
+  return op;
+}
+function avcCodec(au) {   // "avc1.PPCCLL" from the SPS
+  for (let i = 0; i + 7 < au.length; i++) {
+    if (au[i] === 0 && au[i + 1] === 0 && au[i + 2] === 1 && (au[i + 3] & 31) === 7)
+      return "avc1." + [au[i + 4], au[i + 5], au[i + 6]].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return null;
+}
+// Measure the refresh rate before saying hello (120 Hz tablets matter).
+(function measure(n = 0, t0 = 0) {
+  requestAnimationFrame((t) => {
+    if (n === 0) return measure(1, t);
+    if (n < 30) return measure(n + 1, t0);
+    scr.hz = Math.round(29000 / (t - t0)) || 60;
+  });
+})();
+function restartScreen() {
+  if (scr.ws) { scr.ws.onclose = null; scr.ws.close(); scr.ws = null; }
+  if (scr.dec) { try { scr.dec.close(); } catch {} scr.dec = null; }
+  scr.on = false; layout();
+  if (opts.screen) connectScreen();
+}
+function connectScreen() {
+  if (!conn.host || !opts.screen) return;
+  let s;
+  try { s = new WebSocket(`ws://${conn.host}/video?t=${encodeURIComponent(conn.token)}`); } catch { return; }
+  scr.ws = s;
+  s.binaryType = "arraybuffer";
+  const ack = (id) => { if (s.readyState === 1) s.send("a" + id); };
+  s.onopen = () => {
+    scr.retry = 300;
+    const usb = /^(localhost|127\.0\.0\.1|\[::1\])(:|$)/.test(conn.host);
+    const codecs = "tiles" + (scr.h264 ? ",h264" : "");
+    s.send(`hv=1;w=${Math.round(screen.width * dpr)};h=${Math.round(screen.height * dpr)};hz=${scr.hz}` +
+      `;pix=bgrx,rgb565;enc=lz4,raw;codec=${codecs};link=${usb ? "usb" : "wifi"}${opts.h264 ? ";prefer=h264" : ""}`);
+  };
+  let img = null, raw = new Uint8Array(0);
+  s.onmessage = (m) => {
+    const d = m.data;
+    if (typeof d === "string") {
+      if (d[0] === "c") {
+        const c = Object.fromEntries(d.slice(1).split(";").map((kv) => kv.split("=")));
+        const sc = $("screen");
+        scr.w = +c.w; scr.h = +c.h; scr.codec = c.codec;
+        if (sc.width !== scr.w || sc.height !== scr.h || !scr.ctx) {
+          sc.width = scr.w; sc.height = scr.h;
+          scr.ctx = sc.getContext("2d", { desynchronized: true, alpha: false });
+        }
+        scr.on = true; layout();
+      } else if (d[0] === "e") {
+        $("info").textContent = "Screen: " + d.slice(1);
+      } else if (d[0] === "p") {
+        // our own ping on this socket: ignore
+      }
+      return;
+    }
+    const b = new Uint8Array(d), v = new DataView(d);
+    if (b[0] === 84 && scr.ctx) {            // 'T': one changed rectangle
+      const flags = b[1], enc = b[2], pix = b[3], id = v.getUint32(4, true);
+      const x = v.getUint16(12, true), y = v.getUint16(14, true), w = v.getUint16(16, true), h = v.getUint16(18, true);
+      const n = v.getUint32(20, true);
+      let src = b.subarray(24);
+      if (enc === 1) { if (raw.length < n) raw = new Uint8Array(n * 2); lz4(src, raw); src = raw; }
+      if (!img || img.width !== w || img.height !== h) img = new ImageData(w, h);
+      const out = img.data, px = w * h;
+      if (pix === 0) {
+        for (let i = 0, o = 0; i < px; i++, o += 4) { out[o] = src[o + 2]; out[o + 1] = src[o + 1]; out[o + 2] = src[o]; out[o + 3] = 255; }
+      } else {
+        for (let i = 0, o = 0; i < px; i++, o += 4) {
+          const p = src[2 * i] | src[2 * i + 1] << 8;
+          out[o] = (p >> 8) & 0xf8; out[o + 1] = (p >> 3) & 0xfc; out[o + 2] = (p << 3) & 0xf8; out[o + 3] = 255;
+        }
+      }
+      scr.ctx.putImageData(img, x, y);
+      if (flags & 1) ack(id);
+    } else if (b[0] === 72 && scr.ctx) {     // 'H': one H.264 access unit
+      const flags = b[1], id = v.getUint32(4, true), au = b.subarray(16);
+      if (!scr.dec) {
+        const codec = avcCodec(au);
+        if (!codec) return;
+        scr.dec = new VideoDecoder({
+          output: (frame) => {
+            scr.ctx.drawImage(frame, 0, 0, scr.w, scr.h);
+            const fid = frame.timestamp / 1000;
+            frame.close();
+            if (!scr.dup.delete(fid)) ack(fid);
+          },
+          error: () => { scr.dec = null; if (s.readyState === 1) s.send("k"); },
+        });
+        scr.dec.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "prefer-hardware" });
+      }
+      if (flags & 4) scr.dup.add(id);
+      scr.dec.decode(new EncodedVideoChunk({ type: flags & 2 ? "key" : "delta", timestamp: id * 1000, data: au }));
+    }
+  };
+  s.onclose = () => {
+    if (scr.ws !== s) return;
+    scr.ws = null; scr.on = false;
+    if (scr.dec) { try { scr.dec.close(); } catch {} scr.dec = null; }
+    layout();
+    setTimeout(connectScreen, scr.retry); scr.retry = Math.min(scr.retry * 2, 3000);
+  };
+}
+setTimeout(connectScreen, 600);   // after the refresh-rate measurement
 
 // ---------------------------------------------------------------- samples
 // Message: u32 send time (0.1 ms units, for the server's uplink stats), then
@@ -341,10 +485,7 @@ function frame() {
   if (dirty || segs.length) {
     dirty = false;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, innerWidth, innerHeight);
-    ctx.fillStyle = "#000";
-    ctx.fillRect(region.x, region.y, region.w, region.h);
+    ctx.clearRect(0, 0, innerWidth, innerHeight);   // the PC screen shows through
     ctx.strokeStyle = online() ? "#1a1d22" : "#f8514966";
     ctx.lineWidth = 1;
     ctx.strokeRect(region.x + 0.5, region.y + 0.5, region.w - 1, region.h - 1);

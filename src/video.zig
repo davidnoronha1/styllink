@@ -45,6 +45,7 @@ const T_PACE: u64 = 4;
 const T_STAT: u64 = 5;
 const T_ENC_IN: u64 = 6;
 const T_ENC_OUT: u64 = 7;
+const T_POLL: u64 = 8;
 
 pub const DEFAULT_ENCODER = "ffmpeg -hide_banner -loglevel error -probesize 32 -analyzeduration 0 -fflags +nobuffer " ++
     "-f rawvideo -pix_fmt bgr0 -video_size {w}x{h} -framerate {fps} -i - -an -fps_mode passthrough " ++
@@ -94,6 +95,7 @@ var handoff: [2]i32 = .{ -1, -1 };
 var epfd: i32 = -1;
 var pace_fd: i32 = -1;
 var stat_fd: i32 = -1;
+var poll_fd: i32 = -1;
 
 // The one video client (a newer one replaces it).
 var fd: i32 = -1;
@@ -219,6 +221,14 @@ fn run() void {
     watch(handoff[0], linux.EPOLL.IN, T_HANDOFF);
     watch(pace_fd, linux.EPOLL.IN, T_PACE);
     watch(stat_fd, linux.EPOLL.IN, T_STAT);
+    if (cfg.video_poll_ms > 0) {
+        poll_fd = @intCast(util.check(linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true }), "timerfd_create"));
+        const ms = cfg.video_poll_ms;
+        const every = linux.timespec{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * std.time.ns_per_ms) };
+        const poll_spec = linux.itimerspec{ .it_interval = every, .it_value = every };
+        _ = linux.timerfd_settime(poll_fd, .{}, &poll_spec, null);
+        watch(poll_fd, linux.EPOLL.IN, T_POLL);
+    }
 
     var events: [8]linux.epoll_event = undefined;
     while (true) {
@@ -258,6 +268,15 @@ fn handle(e: linux.epoll_event) void {
             var n: u64 = 0;
             _ = linux.read(stat_fd, std.mem.asBytes(&n), 8);
             onSecond();
+        },
+        T_POLL => {
+            var n: u64 = 0;
+            _ = linux.read(poll_fd, std.mem.asBytes(&n), 8);
+            // Safety net: diff everything; only real changes are sent.
+            if (streaming and !ses.source) {
+                for (0..ses.th) |ty| @memset(dirty[ty][0..ses.tw], true);
+                any_dirty = true;
+            }
         },
         T_ENC_IN => writeEncoder(),
         T_ENC_OUT => readEncoder(),
@@ -1096,6 +1115,7 @@ fn nudgeEncoder() void {
 }
 
 fn writeEncoder() void {
+    if (enc_in == -1) return; // stopped earlier in this batch of events
     while (enc_in_off < enc_in_len) {
         const rc = linux.write(enc_in, prev[enc_in_off..].ptr, enc_in_len - enc_in_off);
         switch (linux.errno(rc)) {
@@ -1112,6 +1132,7 @@ fn writeEncoder() void {
 }
 
 fn readEncoder() void {
+    if (enc_out == -1) return;
     while (au_len < au.len) {
         const rc = linux.read(enc_out, au[au_len..].ptr, au.len - au_len);
         switch (linux.errno(rc)) {
@@ -1154,6 +1175,7 @@ fn readEncoder() void {
 }
 
 fn sendAu(data: []const u8) void {
+    if (data.len == 0) return;
     var key = false;
     var i: usize = 0;
     while (i + 3 < data.len) : (i += 1) {

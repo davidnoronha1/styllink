@@ -41,6 +41,9 @@ pub const Config = struct {
     video_scale: u32 = 0, // 0 = auto, 1 = native, 2 = half size
     video_fps: u32 = 0, // 0 = the tablet's refresh rate
     video_inflight: u32 = 2, // unacknowledged frames before capture waits
+    // Rescan the whole region this often (ms) in case DAMAGE misses a change
+    // (some compositors, fullscreen GL); unchanged tiles still cost no bytes.
+    video_poll_ms: u32 = 250,
     // H.264: a command that reads raw BGRX frames on stdin ({w} {h} {fps})
     // and writes Annex-B H.264 to stdout. "" = the built-in ffmpeg/x264 line.
     video_encoder: []const u8 = "",
@@ -76,6 +79,7 @@ pub fn usage() noreturn {
         \\  --video-scale N     0 = auto, 1 = native, 2 = half resolution
         \\  --video-fps N       frame rate cap (default: the tablet's refresh rate)
         \\  --video-inflight N  frames on the wire before capture waits (default 2)
+        \\  --video-poll MS     full rescan interval for missed damage (default 250, 0 = off)
         \\  --video-encoder CMD H.264 encoder: raw BGRX on stdin -> Annex-B on stdout
         \\  --video-source CMD  H.264 capture command (Wayland, hardware pipelines)
         \\
@@ -155,6 +159,8 @@ pub fn parseArgs(init: std.process.Init.Minimal, token_buf: *[12]u8) Config {
         } else if (std.mem.eql(u8, a, "--video-inflight")) {
             cfg.video_inflight = std.fmt.parseInt(u32, v, 10) catch usage();
             if (cfg.video_inflight == 0) usage();
+        } else if (std.mem.eql(u8, a, "--video-poll")) {
+            cfg.video_poll_ms = std.fmt.parseInt(u32, v, 10) catch usage();
         } else if (std.mem.eql(u8, a, "--video-encoder")) {
             cfg.video_encoder = v;
         } else if (std.mem.eql(u8, a, "--video-source")) {

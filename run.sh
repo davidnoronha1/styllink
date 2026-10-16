@@ -44,7 +44,7 @@ for arg in "$@"; do
       case "$arg" in
         --port) EXPECT_VALUE=port ;;
         --token) TOKEN_SET=true; EXPECT_VALUE=skip ;;
-        --busy|--no-uinput|--usb-qr) ;;
+        --busy|--realtime|--no-uinput|--no-video|--usb-qr) ;;
         *) EXPECT_VALUE=skip ;;
       esac
       ;;

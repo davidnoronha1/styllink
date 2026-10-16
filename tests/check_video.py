@@ -5,7 +5,7 @@ Starts Xvfb and the server, connects to /video like a tablet, draws on the
 X screen and checks that the picture rebuilt from the stream matches the
 screen pixel for pixel. Also reports draw-to-receive latency per update.
 
-Needs Xvfb, python-xlib and lz4 (pip install python-xlib lz4); the H.264
+Needs Xvfb, python-xlib, lz4 and numpy (pip install python-xlib lz4 numpy); the H.264
 case also needs ffmpeg with libx264.
   python3 tests/check_video.py [path/to/styllink]
 """
@@ -19,6 +19,7 @@ import sys
 import time
 
 import lz4.block
+import numpy as np
 from Xlib import X, display
 
 W, H = 640, 480
@@ -92,6 +93,7 @@ class Screen:
         nbytes = 0
         while True:
             op, p = ws_recv(self.sock)
+            self.arrived = time.perf_counter()  # before our (slow, Python) decoding
             if op == 1:
                 if p[:1] == b"c":
                     self.config(p.decode())
@@ -121,12 +123,8 @@ class Screen:
                     rgb = bytearray(w * 3)
                     rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
                 else:
-                    rgb = bytearray(w * 3)
-                    for i in range(w):
-                        v = line[2 * i] | line[2 * i + 1] << 8
-                        rgb[3 * i] = (v >> 11) << 3
-                        rgb[3 * i + 1] = ((v >> 5) & 63) << 2
-                        rgb[3 * i + 2] = (v & 31) << 3
+                    v = np.frombuffer(line, dtype="<u2")
+                    rgb = np.stack([(v >> 11) << 3, ((v >> 5) & 63) << 2, (v & 31) << 3], axis=1).astype(np.uint8).tobytes()
                 self.fb[o : o + w * 3] = rgb
             rects += 1
             if flags & 1:
@@ -195,7 +193,7 @@ def run_case(server, name, hello, extra_args, check_scale, pix, tol=0):
                 root.fill_rectangle(gc, 40 + i * 10, 40, 60, 60)
                 d.sync()
                 scr.frame()
-                lat.append((time.perf_counter() - t) * 1000)
+                lat.append((scr.arrived - t) * 1000)
             path = "/tmp/claude-video-check.h264"
             with open(path, "wb") as f:
                 f.write(b"".join(scr.au))
@@ -204,10 +202,12 @@ def run_case(server, name, hello, extra_args, check_scale, pix, tol=0):
             # Raw streams carry no timestamps; only decoder complaints count.
             bad = [l for l in dec.stderr.decode().splitlines() if l.startswith("[h264")]
             assert dec.returncode == 0 and not bad, bad
-            frames = len(dec.stdout) // (W * H * 3)
+            size = scr.w * scr.h * 3  # H.264 rounds the region down to even sizes
+            frames = len(dec.stdout) // size
             assert frames == len(scr.au), (frames, len(scr.au))  # every access unit is one picture
-            last = dec.stdout[-W * H * 3:]
-            want = x_rgb(d, 1, "bgrx")
+            last = dec.stdout[-size:]
+            full = x_rgb(d, 1, "bgrx")
+            want = b"".join(full[y * W * 3 : (y * W + scr.w) * 3] for y in range(scr.h))
             err = sum(abs(p - q) for p, q in zip(last, want)) / len(want)
             assert err < 3, f"last decoded picture differs from the screen (mean error {err:.1f})"
             print(f"  {name}: {len(scr.au)} access units decode cleanly, last matches the screen; "
@@ -224,7 +224,7 @@ def run_case(server, name, hello, extra_args, check_scale, pix, tol=0):
             root.fill_rectangle(gc, (i * 37) % (W - 40), (i * 23) % (H - 40), 3 + i % 7, 30)  # a pen-sized stroke
             d.sync()
             st = scr.frame()
-            lat.append((time.perf_counter() - t) * 1000)
+            lat.append((scr.arrived - t) * 1000)
             sizes.append(st["bytes"])
         # A big change: most of the screen.
         gc.change(foreground=0xC0C0C0)
@@ -232,7 +232,7 @@ def run_case(server, name, hello, extra_args, check_scale, pix, tol=0):
         root.fill_rectangle(gc, 10, 10, W - 20, H - 20)
         d.sync()
         big = scr.frame()["bytes"]
-        big_ms = (time.perf_counter() - t) * 1000
+        big_ms = (scr.arrived - t) * 1000
         while not close_enough(scr.fb, x_rgb(d, check_scale, pix), tol):
             big += scr.frame()["bytes"]
         idle, busy = sorted(lat[1::2]), sorted(lat[0::2])

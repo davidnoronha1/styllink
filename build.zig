@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) void {
     link_tests.setCwd(b.path("."));
     link_tests.has_side_effects = true;
     b.step("test-link", "Run Java WebSocket tests (requires a JDK)").dependOn(&link_tests.step);
+    const video_tests = b.addSystemCommand(&.{ "python3", "tests/check_video.py" });
+    video_tests.addArtifactArg(server);
+    video_tests.setCwd(b.path("."));
+    video_tests.has_side_effects = true;
+    b.step("test-video", "Run the remote screen check (Xvfb, ffmpeg, python-xlib, lz4, numpy)").dependOn(&video_tests.step);
 
     const apk_file = buildApk(b);
     const install_apk = b.addInstallFile(apk_file, "android/styllink.apk");
