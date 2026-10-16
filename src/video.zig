@@ -66,6 +66,7 @@ pub const Caps = struct {
     raw: bool = false,
     tiles: bool = false,
     h264: bool = false,
+    prefer_h264: bool = false, // the tablet's user asked for H.264
     usb: bool = false,
 };
 
@@ -359,6 +360,7 @@ pub fn parseCaps(s: []const u8) Caps {
         if (std.mem.eql(u8, k, "h")) c.h = std.fmt.parseInt(u32, v, 10) catch 0;
         if (std.mem.eql(u8, k, "hz")) c.hz = std.math.clamp(std.fmt.parseInt(u32, v, 10) catch 60, 1, 1000);
         if (std.mem.eql(u8, k, "link")) c.usb = std.mem.eql(u8, v, "usb");
+        if (std.mem.eql(u8, k, "prefer")) c.prefer_h264 = std.mem.eql(u8, v, "h264");
         var items = std.mem.splitScalar(u8, v, ',');
         while (items.next()) |item| {
             if (std.mem.eql(u8, k, "pix")) {
@@ -386,7 +388,7 @@ pub fn negotiate(c: config.Config, k: Caps, w: u32, h: u32) ?Session {
         if (!k.h264) return null;
         s.codec = .h264;
         s.source = true;
-    } else if (c.video_codec == .h264) {
+    } else if (c.video_codec == .h264 or (c.video_codec == .auto and k.prefer_h264)) {
         s.codec = if (k.h264) .h264 else if (k.tiles) .tiles else return null;
     } else {
         s.codec = if (k.tiles) .tiles else if (k.h264) .h264 else return null;
@@ -1223,6 +1225,8 @@ test "negotiate picks formats from tablet caps and the link" {
     try testing.expectEqual(@as(u32, 1920), s3.sw);
     try testing.expectEqual(@as(u32, 1080), s3.sh);
     try testing.expect(negotiate(h, parseCaps("codec=h264"), 640, 480) != null);
+    try testing.expectEqual(Codec.h264, negotiate(c, parseCaps("codec=tiles,h264;prefer=h264"), 640, 480).?.codec);
+    try testing.expectEqual(Codec.tiles, negotiate(c, parseCaps("codec=tiles;prefer=h264"), 640, 480).?.codec);
     var src: config.Config = .{};
     src.video_source = "cat";
     try testing.expect(negotiate(src, wifi, 640, 480) == null);

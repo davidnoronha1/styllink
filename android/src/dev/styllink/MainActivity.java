@@ -8,7 +8,9 @@ import android.provider.MediaStore;
 import android.content.SharedPreferences;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
+import android.graphics.RectF;
 import android.os.Bundle;
+import android.view.Display;
 import android.text.InputType;
 import android.view.WindowInsets;
 import android.view.Gravity;
@@ -30,10 +32,13 @@ import android.widget.TextView;
  * power saving off, which a web page cannot ask for. Measured on the Moto Pad
  * 60 Pro, power save made the radio send in ~100 ms bursts with ~130 ms gaps.
  */
-public final class MainActivity extends Activity implements Link.Listener, PadView.Host {
+public final class MainActivity extends Activity implements Link.Listener, PadView.Host, ScreenView.Listener {
     private SharedPreferences prefs;
     private Link link;
     private PadView pad;
+    private ScreenView screen;
+    private FrameLayout canvasLayout;
+    private int streamW, streamH;
     private WifiManager.WifiLock wifiLock;
     private TextView status;
     private boolean resumed;
@@ -45,7 +50,15 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         applyIntent(getIntent());
         link = new Link(this);
         pad = new PadView(this, this);
-        FrameLayout canvasLayout = new FrameLayout(this);
+        screen = new ScreenView(this, this);
+        canvasLayout = new FrameLayout(this);
+        canvasLayout.setBackgroundColor(0xFF000000);
+        canvasLayout.addView(screen, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT, Gravity.CENTER));
+        canvasLayout.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
+            if (r - l != or - ol || b - t != ob - ot) v.post(this::layoutScreen);
+        });
+        pad.setSeeThrough(showScreen());
         canvasLayout.addView(pad, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
         float density = getResources().getDisplayMetrics().density;
@@ -73,6 +86,7 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         WindowManager.LayoutParams lp = getWindow().getAttributes();
         lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
+        lp.preferredDisplayModeId = fastestMode();
         getWindow().setAttributes(lp);
 
         WifiManager wm = getApplicationContext().getSystemService(WifiManager.class);
@@ -86,7 +100,10 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        if (applyIntent(intent) && resumed) link.start(host(), token());
+        if (applyIntent(intent) && resumed) {
+            link.start(host(), token());
+            startScreen();
+        }
     }
 
     /** styllink://connect?h=<ip:port>&t=<token> */
@@ -111,12 +128,14 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         hideBars();
         applyLock();
         link.start(host(), token());
+        startScreen();
     }
 
     @Override
     protected void onPause() {
         resumed = false;
         link.stop();
+        screen.stop();
         if (wifiLock.isHeld()) wifiLock.release();
         super.onPause();
     }
@@ -139,6 +158,74 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         if (c == null) return;
         c.hide(WindowInsets.Type.systemBars());
         c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+    }
+
+    /** Highest refresh rate at the current resolution: less latency for pen and screen. */
+    private int fastestMode() {
+        Display d = getDisplay();
+        if (d == null) return 0;
+        Display.Mode cur = d.getMode(), best = cur;
+        for (Display.Mode m : d.getSupportedModes()) {
+            if (m.getPhysicalWidth() == cur.getPhysicalWidth() && m.getPhysicalHeight() == cur.getPhysicalHeight()
+                    && m.getRefreshRate() > best.getRefreshRate()) best = m;
+        }
+        return best.getModeId();
+    }
+
+    private boolean showScreen() {
+        return prefs.getBoolean("screen", true);
+    }
+
+    private void startScreen() {
+        pad.setSeeThrough(showScreen());
+        if (!showScreen() || !resumed) {
+            screen.stop();
+            streamW = streamH = 0;
+            layoutScreen();
+            return;
+        }
+        ScreenView.Options o = new ScreenView.Options();
+        o.frontBuffer = prefs.getBoolean("frontBuffer", true);
+        o.preferH264 = prefs.getBoolean("h264", false);
+        screen.start(host(), token(), o);
+    }
+
+    /** Letterboxes the screen to the PC's shape and maps the pen onto it. */
+    private void layoutScreen() {
+        int W = canvasLayout.getWidth(), H = canvasLayout.getHeight();
+        if (W == 0 || H == 0) return;
+        if (streamW == 0 || streamH == 0) {
+            pad.setContent(null);
+            return;
+        }
+        float scale = Math.min(W / (float) streamW, H / (float) streamH);
+        int w = Math.round(streamW * scale), h = Math.round(streamH * scale);
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) screen.getLayoutParams();
+        if (lp.width != w || lp.height != h) {
+            lp.width = w;
+            lp.height = h;
+            lp.gravity = Gravity.CENTER;
+            screen.setLayoutParams(lp);
+        }
+        float left = (W - w) / 2f, top = (H - h) / 2f;
+        pad.setContent(new RectF(left, top, left + w, top + h));
+    }
+
+    // ------------------------------------------------------------ ScreenView.Listener
+
+    @Override
+    public void onScreenFormat(int width, int height) {
+        runOnUiThread(() -> {
+            streamW = width;
+            streamH = height;
+            screen.setStreamSize(width, height);
+            layoutScreen();
+        });
+    }
+
+    @Override
+    public void onScreenStatus(String s) {
+        runOnUiThread(this::updateStatus);
     }
 
     private String host() {
@@ -243,6 +330,19 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         });
         box.addView(fadeSlider);
 
+        CheckBox screenBox = new CheckBox(this);
+        screenBox.setText("Show PC screen");
+        screenBox.setChecked(showScreen());
+        box.addView(screenBox);
+        CheckBox frontBox = new CheckBox(this);
+        frontBox.setText("Front-buffer screen (lowest latency, may tear)");
+        frontBox.setChecked(prefs.getBoolean("frontBuffer", true));
+        box.addView(frontBox);
+        CheckBox h264Box = new CheckBox(this);
+        h264Box.setText("Prefer H.264 screen (video, weak Wi-Fi)");
+        h264Box.setChecked(prefs.getBoolean("h264", false));
+        box.addView(h264Box);
+
         CheckBox lockBox = new CheckBox(this);
         lockBox.setText("Low-latency Wi-Fi");
         lockBox.setChecked(prefs.getBoolean("wifiLock", true));
@@ -262,16 +362,27 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
                             .putBoolean("trail", trailBox.isChecked())
                             .putInt("trailMs", (fadeSlider.getProgress() + 1) * 100)
                             .putBoolean("wifiLock", lockBox.isChecked())
+                            .putBoolean("screen", screenBox.isChecked())
+                            .putBoolean("frontBuffer", frontBox.isChecked())
+                            .putBoolean("h264", h264Box.isChecked())
                             .apply();
                     applyLock();
                     link.start(host(), token());
+                    startScreen();
                 })
                 .setNegativeButton("Close", (d, w) -> {
                     prefs.edit().putBoolean("finger", finger.isChecked()).putBoolean("trail", trailBox.isChecked())
                             .putInt("trailMs", (fadeSlider.getProgress() + 1) * 100)
                             .putBoolean("wifiLock", lockBox.isChecked()).apply();
+                    boolean screenChanged = screenBox.isChecked() != showScreen()
+                            || frontBox.isChecked() != prefs.getBoolean("frontBuffer", true)
+                            || h264Box.isChecked() != prefs.getBoolean("h264", false);
+                    prefs.edit().putBoolean("screen", screenBox.isChecked())
+                            .putBoolean("frontBuffer", frontBox.isChecked())
+                            .putBoolean("h264", h264Box.isChecked()).apply();
                     applyLock();
                     link.sendText(caps());
+                    if (screenChanged) startScreen();
                 })
                 .create();
         cameraButton.setOnClickListener(v -> {
@@ -292,7 +403,8 @@ public final class MainActivity extends Activity implements Link.Listener, PadVi
         String conn = link.connected
                 ? "Connected to " + host() + (link.rttMs >= 0 ? String.format(" · rtt %.1f ms", link.rttMs) : "")
                 : "Not connected" + (link.error.isEmpty() ? "" : " (" + link.error + ")");
-        s.setText(conn + "\nLow-latency Wi-Fi: " + (wifiLock.isHeld() ? "on" : "off"));
+        String scr = !showScreen() ? "screen: off" : screen.status.isEmpty() ? "screen: connecting" : screen.status;
+        s.setText(conn + "\nLow-latency Wi-Fi: " + (wifiLock.isHeld() ? "on" : "off") + "\n" + scr);
     }
 
     // ------------------------------------------------------------ Link.Listener

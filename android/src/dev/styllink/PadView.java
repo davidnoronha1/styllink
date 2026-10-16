@@ -4,6 +4,8 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.PorterDuff;
+import android.graphics.RectF;
 import android.os.Build;
 import android.os.SystemClock;
 import android.view.InputDevice;
@@ -50,6 +52,10 @@ final class PadView extends View {
     private float lastX, lastY;
     private boolean lastInk;
     private boolean online;
+    // With the PC screen shown, the pad is transparent over it and the pen
+    // maps onto the picture's rectangle (letterboxed to the PC's shape).
+    private boolean seeThrough;
+    private RectF content;
     private final MotionPredictor motionPredictor;
 
     // Android reports HOVER_EXIT right before a stylus touches down; sending
@@ -74,6 +80,18 @@ final class PadView extends View {
         ink.setStrokeCap(Paint.Cap.ROUND);
         ink.setColor(0xFFE6EDF3);
         motionPredictor = Build.VERSION.SDK_INT >= 34 ? new MotionPredictor(c) : null;
+    }
+
+    void setSeeThrough(boolean v) {
+        if (v != seeThrough) {
+            seeThrough = v;
+            invalidate();
+        }
+    }
+
+    /** Pen coordinates are relative to this rectangle; null = the whole view. */
+    void setContent(RectF r) {
+        content = r;
     }
 
     void setOnline(boolean v) {
@@ -163,7 +181,11 @@ final class PadView extends View {
     }
 
     private void putSample(float x, float y, float pressure, float tilt, float orient, int flags, long ageNanos) {
-        float w = Math.max(1, getWidth()), h = Math.max(1, getHeight());
+        RectF c = content;
+        float left = c != null ? c.left : 0, top = c != null ? c.top : 0;
+        float w = Math.max(1, c != null ? c.width() : getWidth()), h = Math.max(1, c != null ? c.height() : getHeight());
+        x -= left;
+        y -= top;
         // Android: tilt from vertical + orientation; convert to the PointerEvent
         // tiltX/tiltY convention the server expects (as Chromium does).
         double st = Math.sin(tilt), ct = Math.cos(tilt);
@@ -264,7 +286,8 @@ final class PadView extends View {
 
     @Override
     protected void onDraw(Canvas canvas) {
-        canvas.drawColor(Color.BLACK);
+        if (seeThrough) canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR);
+        else canvas.drawColor(Color.BLACK);
 
         long now = SystemClock.uptimeMillis();
         int fadeMs = host.trailDurationMs();
