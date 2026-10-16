@@ -6,6 +6,7 @@ const util = @import("util.zig");
 const config = @import("config.zig");
 const input = @import("input.zig");
 const stats = @import("stats.zig");
+const video = @import("video.zig");
 const index_html = @import("page").html;
 
 pub const MAX_CLIENTS = 16;
@@ -41,6 +42,10 @@ pub fn init(c: config.Config) void {
 }
 
 pub fn closeClient(c: *Client) void {
+    if (c.fd == -1) { // handed to the video thread
+        c.* = .{};
+        return;
+    }
     if (c.ws) {
         active_ws -= 1;
         // Lift the pen whenever a drawing client goes away; never leave a
@@ -129,7 +134,8 @@ pub fn handleHttp(c: *Client) bool {
     }
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
 
-    if (std.mem.eql(u8, path, "/ws")) {
+    const is_video = std.mem.eql(u8, path, "/video") and video.enabled();
+    if (std.mem.eql(u8, path, "/ws") or is_video) {
         const key = headerValue(head, "Sec-WebSocket-Key") orelse {
             httpReply(c, "400 Bad Request", "text/plain", "expected websocket\n");
             return false;
@@ -154,6 +160,14 @@ pub fn handleHttp(c: *Client) bool {
         const r = std.fmt.bufPrint(&resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" ++
             "Connection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return false;
         if (!util.writeAll(c.fd, r)) return false;
+
+        if (is_video) {
+            // The screen stream lives on its own thread and epoll loop.
+            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, c.fd, null);
+            video.adopt(c.fd);
+            c.fd = -1;
+            return false;
+        }
 
         c.ws = true;
         active_ws += 1;

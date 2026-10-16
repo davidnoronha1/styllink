@@ -10,6 +10,7 @@ const util = @import("util.zig");
 const input = @import("input.zig");
 const stats = @import("stats.zig");
 const ws = @import("ws.zig");
+const video = @import("video.zig");
 
 const check = util.check;
 
@@ -156,6 +157,8 @@ fn setRealtime() void {
 pub fn main(init: std.process.Init.Minimal) void {
     var token_buf: [12]u8 = undefined;
     cfg = config.parseArgs(init, &token_buf);
+    // Before --realtime: the video thread must not inherit SCHED_FIFO.
+    video.start(cfg, init.environ);
 
     if (cfg.realtime) {
         setRealtime();
@@ -202,4 +205,7 @@ test {
     _ = @import("config.zig");
     _ = @import("input.zig");
     _ = @import("ws.zig");
+    _ = @import("lz4.zig");
+    _ = @import("x11.zig");
+    _ = @import("video.zig");
 }
