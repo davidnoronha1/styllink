@@ -1,0 +1,132 @@
+//! Configuration options and command-line argument parsing.
+
+const std = @import("std");
+const linux = std.os.linux;
+const util = @import("util.zig");
+
+pub const DEFAULT_WEB_URL = "https://styllink.vercel.app";
+
+pub const Config = struct {
+    port: u16 = 8080,
+    token: []const u8 = "",
+    token_set: bool = false,
+    // Target rectangle on the desktop, and the full desktop size. libinput maps
+    // the tablet's full range onto the whole desktop, so a region is reached
+    // by scaling into a sub-range.
+    region: [4]u32 = .{ 0, 0, 1920, 1080 },
+    desktop: [2]u32 = .{ 1920, 1080 },
+    busy: bool = false,
+    uinput: bool = true,
+    usb_qr: bool = false,
+    // Frames per pen sample; cancels libinput's 4-frame tablet smoothing.
+    // 1 = off (e.g. once AttrTabletSmoothing=0 is active in X).
+    unsmooth: usize = 4,
+    // Hosted copy of web/index.html; "" = only use the page served by us.
+    web_url: []const u8 = DEFAULT_WEB_URL,
+    // JSON-lines log of connections, per-second link stats and stalls.
+    log_path: [:0]const u8 = "",
+    // Burst smoothing: samples that arrive late in a bunch are replayed with
+    // their original spacing at `catchup` x real speed (0 = no smoothing,
+    // just write them at once). `jitter_ms` adds a fixed playout delay that
+    // absorbs that much network jitter completely.
+    catchup: f64 = 2.0,
+    jitter_ms: u32 = 0,
+    realtime: bool = false,
+};
+
+pub fn usage() noreturn {
+    std.debug.print(
+        \\usage: styllink [options]
+        \\  --port N            listen port (default 8080)
+        \\  --token STR         access token (default: random); "" disables the check
+        \\  --region X,Y,W,H    desktop rectangle to map the pad onto
+        \\  --desktop W,H       full desktop size (for --region)
+        \\  --busy              spin instead of sleeping: lowest wake-up latency, burns a core
+        \\  --realtime          set SCHED_FIFO or -20 nice priority for minimum latency
+        \\  --unsmooth N        frames per sample to cancel libinput smoothing (default 4, 1 = off)
+        \\  --web-url URL       printed browser URL ("" = use the page served by this PC)
+        \\  --catchup X         replay late bursts at X times real speed (default 2; 0 = snap)
+        \\  --jitter-ms N       fixed playout delay that hides N ms of network jitter (default 0)
+        \\  --log PATH          JSON-lines log (default off)
+        \\  --usb-qr            show USB QR first (requires working adb reverse)
+        \\  --no-uinput         don't create the pen device (network benchmarking)
+        \\
+    , .{});
+    linux.exit(2);
+}
+
+pub fn parseList(comptime n: usize, s: []const u8) [n]u32 {
+    var out: [n]u32 = undefined;
+    var it = std.mem.splitScalar(u8, s, ',');
+    for (&out) |*v| {
+        const part = it.next() orelse usage();
+        v.* = std.fmt.parseInt(u32, part, 10) catch usage();
+    }
+    if (it.next() != null) usage();
+    return out;
+}
+
+pub fn parseArgs(init: std.process.Init.Minimal, token_buf: *[12]u8) Config {
+    var cfg: Config = .{};
+    var args = init.args.iterate();
+    _ = args.skip();
+    while (args.next()) |a| {
+        if (std.mem.eql(u8, a, "--busy")) {
+            cfg.busy = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--realtime")) {
+            cfg.realtime = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--usb-qr")) {
+            cfg.usb_qr = true;
+            continue;
+        }
+        if (std.mem.eql(u8, a, "--no-uinput")) {
+            cfg.uinput = false;
+            continue;
+        }
+        const v = args.next() orelse usage();
+        if (std.mem.eql(u8, a, "--port")) {
+            cfg.port = std.fmt.parseInt(u16, v, 10) catch usage();
+        } else if (std.mem.eql(u8, a, "--token")) {
+            cfg.token = v;
+            cfg.token_set = true;
+        } else if (std.mem.eql(u8, a, "--region")) {
+            cfg.region = parseList(4, v);
+        } else if (std.mem.eql(u8, a, "--desktop")) {
+            cfg.desktop = parseList(2, v);
+        } else if (std.mem.eql(u8, a, "--catchup")) {
+            cfg.catchup = std.fmt.parseFloat(f64, v) catch usage();
+            if (cfg.catchup != 0 and cfg.catchup < 1) usage();
+        } else if (std.mem.eql(u8, a, "--jitter-ms")) {
+            cfg.jitter_ms = std.fmt.parseInt(u32, v, 10) catch usage();
+        } else if (std.mem.eql(u8, a, "--log")) {
+            cfg.log_path = v;
+        } else if (std.mem.eql(u8, a, "--web-url")) {
+            cfg.web_url = v;
+        } else if (std.mem.eql(u8, a, "--unsmooth")) {
+            cfg.unsmooth = std.fmt.parseInt(usize, v, 10) catch usage();
+            if (cfg.unsmooth == 0 or cfg.unsmooth > 16) usage();
+        } else usage();
+    }
+    if (cfg.region[2] == 0 or cfg.region[3] == 0 or cfg.desktop[0] == 0 or cfg.desktop[1] == 0) usage();
+
+    if (!cfg.token_set) {
+        var rnd: [6]u8 = undefined;
+        _ = util.check(linux.getrandom(&rnd, rnd.len, 0), "getrandom");
+        const hex = std.fmt.bytesToHex(rnd, .lower);
+        token_buf.* = hex;
+        cfg.token = token_buf;
+    }
+
+    return cfg;
+}
+
+test "parseList parses valid comma-separated integers" {
+    const testing = std.testing;
+    const r = parseList(4, "10,20,30,40");
+    try testing.expectEqual([4]u32{ 10, 20, 30, 40 }, r);
+}
+

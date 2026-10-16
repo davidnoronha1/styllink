@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build (if needed) and start styllink mapped to one monitor. Extra args are
-# passed through (e.g. --busy, --io uring, --port 9000, --token foo).
+# passed through (e.g. --busy, --realtime, --port 9000, --token foo).
 #   ./run.sh                 primary monitor
 #   MONITOR=HDMI-0 ./run.sh  pick a monitor by xrandr name
 set -e

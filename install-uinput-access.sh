@@ -18,6 +18,8 @@ echo "ok: uinput access: $(getfacl -p /dev/uinput 2>/dev/null | grep "user:$(id 
 QUIRKS=/etc/libinput/local-overrides.quirks
 sudo mkdir -p /etc/libinput
 if ! sudo grep -q '^\[StylLink Pen\]' "$QUIRKS" 2>/dev/null; then
-  printf '\n[StylLink Pen]\nMatchName=StylLink Pen\nAttrTabletSmoothing=0\n' | sudo tee -a "$QUIRKS" >/dev/null
+  printf '\n[StylLink Pen]\nMatchName=StylLink Pen\nModelTabletSmoothing=0\nAttrTabletSmoothing=0\n' | sudo tee -a "$QUIRKS" >/dev/null
+elif ! sudo grep -q 'ModelTabletSmoothing=0' "$QUIRKS" 2>/dev/null; then
+  printf 'ModelTabletSmoothing=0\n' | sudo tee -a "$QUIRKS" >/dev/null
 fi
 echo "ok: libinput smoothing disabled for StylLink Pen ($QUIRKS); restart styllink to apply"

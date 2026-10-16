@@ -77,6 +77,6 @@ STYLLINK_USB=0 ./run.sh              # Skip automatic USB setup.
 ```
 
 USB gives the most stable connection. For wireless use, try Ethernet on the PC.
-Check `styllink.log` if input stops or has delays.
+Pass `--log PATH` (for example, `--log styllink.log`) to record events if input stops or has delays.
 
 Use a trusted network. The connection is not encrypted.

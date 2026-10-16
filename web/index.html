@@ -260,7 +260,10 @@ function send(e, inRange) {
   out.setUint32(0, Math.floor(now * 10) >>> 0, true);
   ws.send(bytes.subarray(0, 4 + evs.length * 10));
   lastSend = performance.now();
-  if (opts.trail) trail(evs, flags);
+  if (opts.trail) {
+    const predicted = inRange && typeof e.getPredictedEvents === "function" ? e.getPredictedEvents() : [];
+    trail(evs, flags, predicted);
+  }
 }
 
 // ---------------------------------------------------------------- pointer input
@@ -303,14 +306,30 @@ for (const type of ["pointercancel", "pointerleave"]) {
 // pad frame turns red while disconnected, the only status shown when folded.
 const segs = [];
 let lastPt = null, cursor = null, dirty = true;
-function trail(evs, flags) {
+function trail(evs, flags, predicted) {
+  const list = Array.isArray(evs) ? evs : (evs ? [evs] : []);
   const now = performance.now();
-  for (const e of evs) {
+  for (const e of list) {
     const pt = { x: e.clientX, y: e.clientY };
     const touching = (flags & TOUCH) !== 0;
     if (touching && lastPt) segs.push({ a: lastPt, b: pt, w: 1 + 4 * (e.pressure || 0.5), t: now, er: flags & ERASER });
     lastPt = touching ? pt : null;
     cursor = flags & IN_RANGE ? pt : null;
+  }
+  if ((!predicted || !predicted.length) && list.length) {
+    const last = list[list.length - 1];
+    if (typeof last?.getPredictedEvents === "function") {
+      try { predicted = last.getPredictedEvents(); } catch {}
+    }
+  }
+  if (predicted && predicted.length) {
+    for (const p of predicted) {
+      const pt = { x: p.clientX, y: p.clientY };
+      const touching = (flags & TOUCH) !== 0;
+      if (touching && lastPt) segs.push({ a: lastPt, b: pt, w: 1 + 4 * (p.pressure || 0.5), t: now, er: flags & ERASER });
+      lastPt = touching ? pt : null;
+      cursor = flags & IN_RANGE ? pt : null;
+    }
   }
   if (segs.length > 4000) segs.splice(0, segs.length - 4000);
   dirty = true;

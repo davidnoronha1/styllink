@@ -8,6 +8,7 @@ import android.os.Build;
 import android.os.SystemClock;
 import android.view.InputDevice;
 import android.view.MotionEvent;
+import android.view.MotionPredictor;
 import android.view.View;
 
 import java.nio.ByteBuffer;
@@ -49,6 +50,7 @@ final class PadView extends View {
     private float lastX, lastY;
     private boolean lastInk;
     private boolean online;
+    private final MotionPredictor motionPredictor;
 
     // Android reports HOVER_EXIT right before a stylus touches down; sending
     // that as "out of range" would make the PC see the pen leave and come back
@@ -71,7 +73,7 @@ final class PadView extends View {
         ink.setStyle(Paint.Style.STROKE);
         ink.setStrokeCap(Paint.Cap.ROUND);
         ink.setColor(0xFFE6EDF3);
-
+        motionPredictor = Build.VERSION.SDK_INT >= 34 ? new MotionPredictor(c) : null;
     }
 
     void setOnline(boolean v) {
@@ -99,6 +101,11 @@ final class PadView extends View {
         int action = e.getActionMasked();
         boolean pen = isPen(tool);
         if (!pen && !(tool == MotionEvent.TOOL_TYPE_FINGER && host.fingerDrawing())) return true; // palms etc.
+        if (Build.VERSION.SDK_INT >= 34 && motionPredictor != null) {
+            try {
+                motionPredictor.record(e);
+            } catch (Throwable ignored) {}
+        }
         switch (action) {
             case MotionEvent.ACTION_DOWN:
                 removeCallbacks(sendExit);
@@ -203,6 +210,27 @@ final class PadView extends View {
                 host.link().sendBinary(buf, bb.position());
                 bb.clear();
                 bb.putInt((int) (now / 100_000L));
+            }
+        }
+        if (host.trail() && (flags & TOUCH) != 0 && Build.VERSION.SDK_INT >= 34 && motionPredictor != null) {
+            MotionEvent prediction = null;
+            try {
+                prediction = motionPredictor.predict(now + 20_000_000L);
+                if (prediction != null) {
+                    int predHist = prediction.getHistorySize();
+                    for (int j = 0; j <= predHist; j++) {
+                        boolean cur = j == predHist;
+                        float px = cur ? prediction.getX() : prediction.getHistoricalX(j);
+                        float py = cur ? prediction.getY() : prediction.getHistoricalY(j);
+                        float pp = cur ? prediction.getPressure() : prediction.getHistoricalPressure(j);
+                        trail(px, py, pp, true, t);
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (prediction != null) {
+                    prediction.recycle();
+                }
             }
         }
         if (!segs.isEmpty()) postInvalidateOnAnimation();
