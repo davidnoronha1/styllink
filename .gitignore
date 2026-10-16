@@ -19,3 +19,4 @@
 
 # Local session handoff
 /CONTINUE.md
+__pycache__/
