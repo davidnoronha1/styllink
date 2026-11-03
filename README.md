@@ -1,10 +1,13 @@
 # StylLink
 
-Use your Android tablet as a pen tablet for Linux.
+Use your Android tablet as a pen tablet for Linux, with the Android app or a browser.
 
 Supports pressure, tilt, the pen button, and the eraser. Shows the PC screen
 under the pen, so you draw on the picture itself.
-Works through Wi-Fi or USB. Built with Zig and native Android views.
+Works through Wi-Fi or USB. Built with Zig, native Android views, and a browser client.
+
+**Website:** [styllink.vercel.app](https://styllink.vercel.app/) — use StylLink in
+Chrome without installing the Android APK. The Linux server still runs on your PC.
 
 <img src="assets/demo.gif" alt="Drawing on the tablet and Linux PC" width="240">
 
@@ -17,18 +20,21 @@ Download: [Linux](https://github.com/davidnoronha1/styllink/actions/runs/3871510
 Artifacts expire after 30 days. Open **All builds** for newer downloads.
 
 1. Extract the Linux ZIP, then extract its `.tar.gz` file.
-2. Extract the Android ZIP. Install `styllink.apk` on your tablet.
-3. Run these commands on your PC:
+2. Run these commands on your PC:
 
 ```sh
 make install-uinput-access   # Run once. Requires sudo.
 make run
 ```
 
-Requires Make, Linux with uinput and libinput, plus Android 11 or later.
+For the native Android client, extract the Android ZIP and install `styllink.apk`
+on your tablet. Browser users can skip the APK.
+
+The PC requires Make, Linux with uinput and libinput, and X11 for screen sharing.
+The native app requires Android 11 or later; the website uses Chrome with pen support.
 Tested with Ubuntu 22.04 and X11.
 
-## Connect
+## Connect with the Android app
 
 Open the app menu. Select **Open camera to scan QR**.
 Scan a QR code from the PC terminal, then open its link.
@@ -50,7 +56,61 @@ Screen sharing requires an X11 session. Video settings adapt automatically.
 The menu also has finger input and trail settings.
 Set **Trail fade** from 0.1 to 5 seconds.
 
-For browser input, open the browser link from the terminal in Chrome.
+## Use the website
+
+[styllink.vercel.app](https://styllink.vercel.app/) is the browser client. It
+connects directly to the StylLink server on your PC for pen input and screen
+sharing. Keep the server running while you draw.
+
+### Wi-Fi
+
+1. Connect the PC and tablet to the same network, then start `make run` on the PC.
+2. On the tablet, open the complete **Browser (Chrome)** URL printed in the terminal.
+   It opens the website with the PC address and access token already filled in.
+3. Allow local-network access if Chrome asks, then wait for the connected status.
+   See [Chrome's local-network permission guide](https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access)
+   if access was previously blocked.
+4. Draw with the pen on the displayed PC screen. Keep the page visible and the
+   tablet unlocked.
+
+The terminal QR codes open the native Android app. Use the **Browser (Chrome)**
+link for the website.
+
+To connect manually, open the website and tap the top-right corner to reveal its
+menu. Enter the server's address in **PC address**, such as `192.168.1.20:8080`,
+and copy its token from the terminal's browser URL into **Token**. Press **Connect**.
+The address must point to your PC; opening the website alone does not start a server.
+
+For example, a complete browser link looks like:
+
+```text
+https://styllink.vercel.app/#h=192.168.1.20:8080&t=YOUR_TOKEN
+```
+
+In the menu, **Show PC screen** controls screen sharing, **Finger drawing**
+enables touch input, and **Ink trail preview** shows a local pen trail.
+Use **Fullscreen** to hide browser controls. **Prefer H.264 screen** requests
+H.264 when the server uses the `auto` preset and the browser supports decoding it.
+
+### USB and the local page
+
+Enable USB debugging, approve the PC, and run `make run` with ADB installed.
+The launcher sets up USB forwarding automatically. On the tablet, open the
+terminal's **USB** browser address in Chrome, for example:
+
+```text
+http://localhost:8080/?t=YOUR_TOKEN
+```
+
+This serves the same browser client directly from the PC through USB forwarding.
+Replace the token and port with the values printed by your server.
+
+The terminal also prints a **Local browser fallback** URL using the PC's LAN
+address. That HTTP page can have a lower pen sampling rate because full-rate pen
+APIs require a secure context. Prefer the hosted HTTPS page for Wi-Fi, or the
+`localhost` page for USB. If the hosted page cannot connect, check the PC address,
+server port, and Chrome's local-network permission.
+
 
 ## Build
 

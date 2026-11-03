@@ -1,11 +1,13 @@
 package dev.styllink;
 
 import android.content.Context;
+import android.util.Log;
 import android.view.Display;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 
+import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -16,7 +18,6 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.ThreadLocalRandom;
 
 /**
  * The PC screen, behind the pad. Opens /video next to the pen link, tells the
@@ -38,6 +39,7 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
         boolean preferH264 = false;
     }
 
+    private static final byte[] KEYFRAME_REQUEST = {'k'};
     private final Listener listener;
     private Surface surface;
     private int surfaceW, surfaceH;
@@ -211,7 +213,7 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
             s.setSoTimeout(5000);
             s.connect(new InetSocketAddress(h, port), 3000);
             OutputStream os = s.getOutputStream();
-            InputStream is = s.getInputStream();
+            InputStream is = new BufferedInputStream(s.getInputStream(), 65536);
             os.write(("GET /video?t=" + URLEncoder.encode(token, "UTF-8") + " HTTP/1.1\r\nHost: " + host
                     + "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                     + "Sec-WebSocket-Key: c3R5bGxpbmstc2NyZWVu\r\nSec-WebSocket-Version: 13\r\n"
@@ -219,7 +221,8 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
             String statusLine = readStatus(is);
             if (!statusLine.contains(" 101 ")) throw new IOException(statusLine);
             s.setSoTimeout(0);
-            send(os, 0x1, hello().getBytes(StandardCharsets.US_ASCII));
+            WebSocketWriter writer = new WebSocketWriter(os);
+            writer.send(0x1, hello().getBytes(StandardCharsets.US_ASCII));
 
             DataInputStream in = new DataInputStream(is);
             byte[] buf = new byte[1 << 16];
@@ -227,6 +230,9 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
             Map<String, String> cfg = new HashMap<>();
             boolean h264 = false;
             int frames = 0;
+            final boolean trace = Log.isLoggable("StylLinkVideo", Log.DEBUG);
+            int tileFrames = 0, tileRects = 0;
+            long decodeNs = 0, uploadNs = 0, presentNs = 0, maxPresentNs = 0;
             long since = System.nanoTime();
             while (running) {
                 int b0 = in.readUnsignedByte(), b1 = in.readUnsignedByte();
@@ -239,7 +245,7 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
                 int n = (int) len, op = b0 & 0x0f;
                 if (op == 0x8) break;
                 if (op == 0x9) {
-                    send(os, 0xA, java.util.Arrays.copyOf(buf, n));
+                    writer.send(0xA, buf, 0, n);
                     continue;
                 }
                 if (op == 0x1 && n > 0) {
@@ -264,7 +270,7 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
                         }
                         if (avc == null || !avc.matches(w, hh)) {
                             if (avc != null) avc.release();
-                            avc = new AvcRenderer(surf, w, hh, id -> sendAck(os, id));
+                            avc = new AvcRenderer(surf, w, hh, writer::ack);
                         }
                     } else {
                         if (avc != null) {
@@ -274,6 +280,8 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
                         if (tiles == null || !tiles.matches(w, hh, is565)) {
                             if (tiles != null) tiles.release();
                             tiles = new TileRenderer(surf, w, hh, is565, options.frontBuffer);
+                            if (trace) Log.d("StylLinkVideo", "renderer=" + (tiles.frontBuffered() ? "front" : "swap")
+                                    + " size=" + w + "x" + hh + " pix=" + cfg.get("pix"));
                         }
                     }
                     setStatus(String.format(java.util.Locale.ROOT, "screen: %dx%d %s%s",
@@ -287,29 +295,59 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
                     int id = le32(buf, 4);
                     int x = le16(buf, 12), y = le16(buf, 14), w = le16(buf, 16), hh = le16(buf, 18);
                     int raw = le32(buf, 20);
+                    tiles.validateRect(x, y, w, hh, raw);
+                    long tileStart = trace ? System.nanoTime() : 0;
+                    byte[] decoded;
+                    int decodedOffset;
                     if (enc == 1) {
                         if (pixels.length < raw) pixels = new byte[Math.max(raw, pixels.length * 2)];
-                        Lz4.decode(buf, 24, n - 24, pixels, raw);
-                        tiles.rect(x, y, w, hh, pixels, raw);
+                        if (Lz4.decode(buf, 24, n - 24, pixels, raw) != raw)
+                            throw new IOException("incomplete tile");
+                        decoded = pixels;
+                        decodedOffset = 0;
                     } else {
-                        if (pixels.length < raw) pixels = new byte[Math.max(raw, pixels.length * 2)];
-                        System.arraycopy(buf, 24, pixels, 0, raw);
-                        tiles.rect(x, y, w, hh, pixels, raw);
+                        if (enc != 0 || raw != n - 24) throw new IOException("invalid raw tile");
+                        decoded = buf;
+                        decodedOffset = 24;
+                    }
+                    long uploadStart = trace ? System.nanoTime() : 0;
+                    if (trace) decodeNs += uploadStart - tileStart;
+                    tiles.rect(x, y, w, hh, decoded, decodedOffset, raw);
+                    long uploaded = trace ? System.nanoTime() : 0;
+                    if (trace) {
+                        uploadNs += uploaded - uploadStart;
+                        tileRects++;
                     }
                     if ((flags & 1) != 0) {
                         tiles.present();
-                        sendAck(os, id);
+                        if (trace) {
+                            long presented = System.nanoTime() - uploaded;
+                            presentNs += presented;
+                            maxPresentNs = Math.max(maxPresentNs, presented);
+                            tileFrames++;
+                        }
+                        writer.ack(id);
                         frames++;
                     }
                 } else if (buf[0] == 'H' && avc != null) {
                     int flags = buf[1];
                     if (!avc.feed(buf, 16, n - 16, le32(buf, 4), (flags & 2) != 0, (flags & 4) != 0)) {
-                        send(os, 0x1, new byte[]{'k'}); // decoder stalled: start over from a key frame
+                        writer.send(0x1, KEYFRAME_REQUEST); // decoder stalled: start over from a key frame
                     }
                     if ((flags & 4) == 0) frames++;
                 }
                 long now = System.nanoTime();
                 if (now - since > 2_000_000_000L) {
+                    if (trace && tileFrames > 0) {
+                        // CPU calls only: upload may wait for the driver, and
+                        // present/ack do not measure scanout or visible pixels.
+                        Log.d("StylLinkVideo", String.format(java.util.Locale.ROOT,
+                                "tiles frames=%d rects=%d decode=%.3f upload=%.3f present=%.3f present_max=%.3f ms/frame",
+                                tileFrames, tileRects, decodeNs / 1e6 / tileFrames,
+                                uploadNs / 1e6 / tileFrames, presentNs / 1e6 / tileFrames, maxPresentNs / 1e6));
+                        tileFrames = tileRects = 0;
+                        decodeNs = uploadNs = presentNs = maxPresentNs = 0;
+                    }
                     listener.onScreenStatus(status + String.format(java.util.Locale.ROOT, " · %.0f fps", frames * 1e9 / (now - since)));
                     frames = 0;
                     since = now;
@@ -323,33 +361,6 @@ final class ScreenView extends SurfaceView implements SurfaceHolder.Callback {
             } catch (IOException ignored) {
             }
             socket = null;
-        }
-    }
-
-    private void sendAck(OutputStream os, int id) {
-        try {
-            send(os, 0x1, ("a" + (id & 0xffffffffL)).getBytes(StandardCharsets.US_ASCII));
-        } catch (IOException ignored) {
-        }
-    }
-
-    /** Masked client frame; acks come from the reader and the decoder thread. */
-    private static void send(OutputStream os, int opcode, byte[] p) throws IOException {
-        int hl = p.length < 126 ? 2 : 4;
-        byte[] f = new byte[hl + 4 + p.length];
-        f[0] = (byte) (0x80 | opcode);
-        if (p.length < 126) {
-            f[1] = (byte) (0x80 | p.length);
-        } else {
-            f[1] = (byte) (0x80 | 126);
-            f[2] = (byte) (p.length >> 8);
-            f[3] = (byte) p.length;
-        }
-        int m = ThreadLocalRandom.current().nextInt();
-        for (int i = 0; i < 4; i++) f[hl + i] = (byte) (m >> (24 - 8 * i));
-        for (int i = 0; i < p.length; i++) f[hl + 4 + i] = (byte) (p[i] ^ f[hl + (i & 3)]);
-        synchronized (os) {
-            os.write(f);
         }
     }
 

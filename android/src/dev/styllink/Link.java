@@ -1,5 +1,6 @@
 package dev.styllink;
 
+import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -106,9 +107,8 @@ final class Link {
             f[3] = (byte) len;
         }
         int m = ThreadLocalRandom.current().nextInt();
-        byte[] mask = {(byte) (m >> 24), (byte) (m >> 16), (byte) (m >> 8), (byte) m};
-        System.arraycopy(mask, 0, f, hl, 4);
-        for (int i = 0; i < len; i++) f[hl + 4 + i] = (byte) (p[i] ^ mask[i & 3]);
+        for (int i = 0; i < 4; i++) f[hl + i] = (byte) (m >>> (24 - 8 * i));
+        for (int i = 0; i < len; i++) f[hl + 4 + i] = (byte) (p[i] ^ f[hl + (i & 3)]);
         return f;
     }
 
@@ -164,7 +164,7 @@ final class Link {
             s.setTrafficClass(0xB8); // DSCP EF: WMM voice access category on Wi-Fi
             s.connect(new InetSocketAddress(h, port), 3000);
             OutputStream os = s.getOutputStream();
-            InputStream is = s.getInputStream();
+            InputStream is = new BufferedInputStream(s.getInputStream(), 8192);
             String req = "GET /ws?t=" + URLEncoder.encode(token, "UTF-8") + " HTTP/1.1\r\n"
                     + "Host: " + host + "\r\n"
                     + "Upgrade: websocket\r\nConnection: Upgrade\r\n"
@@ -232,6 +232,7 @@ final class Link {
     private void readLoop(Session session, Socket s, InputStream is) {
         try {
             DataInputStream in = new DataInputStream(is);
+            byte[] p = new byte[128];
             while (true) {
                 int b0 = in.readUnsignedByte();
                 int b1 = in.readUnsignedByte();
@@ -241,20 +242,21 @@ final class Link {
                 else if (len == 127) len = in.readLong();
                 if ((b1 & 0x80) != 0) throw new IOException("masked server frame");
                 if (len < 0 || len > 65535) break;
-                byte[] p = new byte[(int) len];
-                in.readFully(p);
+                int n = (int) len;
+                if (p.length < n) p = new byte[Math.max(n, p.length * 2)];
+                in.readFully(p, 0, n);
                 if (op == 0x8) break;
                 if (op == 0x9) {
-                    session.out.offer(frame(0xA, p, p.length));
+                    session.out.offer(frame(0xA, p, n));
                     continue;
                 }
-                if (op != 0x1 || p.length == 0) continue;
+                if (op != 0x1 || n == 0) continue;
                 char k = (char) p[0];
                 if (k == 'b' || k == 's') {
-                    session.out.offer(frame(0x1, p, p.length)); // server's link benchmark: echo
+                    session.out.offer(frame(0x1, p, n)); // server's link benchmark: echo
                 } else if (k == 'p') {
                     try {
-                        long sent = Long.parseLong(new String(p, 1, p.length - 1, StandardCharsets.US_ASCII));
+                        long sent = Long.parseLong(new String(p, 1, n - 1, StandardCharsets.US_ASCII));
                         if (current == session) {
                             rttMs = (System.nanoTime() - sent) / 1e6;
                             listener.onLinkChanged();

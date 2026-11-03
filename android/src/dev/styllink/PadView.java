@@ -47,6 +47,7 @@ final class PadView extends View {
     }
 
     private final ArrayDeque<Seg> segs = new ArrayDeque<>();
+    private final ArrayDeque<Seg> recycledSegs = new ArrayDeque<>();
     private final Paint ink = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint notice = new Paint(Paint.ANTI_ALIAS_FLAG);
     private float lastX, lastY;
@@ -269,7 +270,8 @@ final class PadView extends View {
 
     private void trail(float x, float y, float p, boolean ink, long t) {
         if (ink && lastInk) {
-            Seg s = new Seg();
+            Seg s = segs.size() >= 4000 ? segs.removeFirst() : recycledSegs.pollFirst();
+            if (s == null) s = new Seg();
             s.x0 = lastX;
             s.y0 = lastY;
             s.x1 = x;
@@ -277,7 +279,6 @@ final class PadView extends View {
             s.w = (1 + 4 * (p > 0 ? p : 0.5f)) * density;
             s.t = t;
             segs.addLast(s);
-            if (segs.size() > 4000) segs.pollFirst();
         }
         lastX = x;
         lastY = y;
@@ -291,7 +292,10 @@ final class PadView extends View {
 
         long now = SystemClock.uptimeMillis();
         int fadeMs = host.trailDurationMs();
-        while (!segs.isEmpty() && now - segs.peekFirst().t > fadeMs) segs.pollFirst();
+        while (!segs.isEmpty() && now - segs.peekFirst().t > fadeMs) {
+            Seg expired = segs.removeFirst();
+            if (recycledSegs.size() < 256) recycledSegs.addLast(expired);
+        }
         for (Seg s : segs) {
             ink.setAlpha((int) (255 * (1 - (now - s.t) / (float) fadeMs)));
             ink.setStrokeWidth(s.w);

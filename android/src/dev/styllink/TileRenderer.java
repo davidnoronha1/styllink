@@ -38,6 +38,9 @@ final class TileRenderer {
     // Bounding box of this frame's rectangles (front buffer: draw only that).
     private int dx0, dy0, dx1, dy1;
     private ByteBuffer upload = ByteBuffer.allocateDirect(0);
+    private final int[] surfaceSize = new int[2];
+    private int textureFilter;
+    private int viewportWidth = -1, viewportHeight = -1;
 
     TileRenderer(Surface surface, int width, int height, boolean rgb565, boolean wantFront) {
         this.width = width;
@@ -126,11 +129,21 @@ final class TileRenderer {
         return w == width && h == height && is565 == rgb565;
     }
 
+    /** Validate the decoded size before a caller allocates or decompresses it. */
+    void validateRect(int x, int y, int w, int h, int len) {
+        if (x < 0 || y < 0 || w <= 0 || h <= 0 || w > width - x || h > height - y
+                || len <= 0 || len > (64 << 20) || len != (long) w * h * (rgb565 ? 2 : 4))
+            throw new IllegalArgumentException("invalid tile bounds");
+    }
+
     /** Uploads one rectangle of decoded pixels (tightly packed rows). */
-    void rect(int x, int y, int w, int h, byte[] pixels, int len) {
+    void rect(int x, int y, int w, int h, byte[] pixels, int offset, int len) {
+        validateRect(x, y, w, h, len);
+        if (offset < 0 || offset > pixels.length - len)
+            throw new IllegalArgumentException("invalid pixel bounds");
         if (upload.capacity() < len) upload = ByteBuffer.allocateDirect(Math.max(len, upload.capacity() * 2));
         upload.clear();
-        upload.put(pixels, 0, len).position(0);
+        upload.put(pixels, offset, len).position(0);
         if (rgb565) {
             GLES20.glTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, x, y, w, h, GLES20.GL_RGB, GLES20.GL_UNSIGNED_SHORT_5_6_5, upload);
         } else {
@@ -144,15 +157,21 @@ final class TileRenderer {
 
     /** Puts the frame on screen. */
     void present() {
-        int[] size = new int[2];
-        EGL14.eglQuerySurface(dpy, surf, EGL14.EGL_WIDTH, size, 0);
-        EGL14.eglQuerySurface(dpy, surf, EGL14.EGL_HEIGHT, size, 1);
-        int sw = size[0], sh = size[1];
-        GLES20.glViewport(0, 0, sw, sh);
+        EGL14.eglQuerySurface(dpy, surf, EGL14.EGL_WIDTH, surfaceSize, 0);
+        EGL14.eglQuerySurface(dpy, surf, EGL14.EGL_HEIGHT, surfaceSize, 1);
+        int sw = surfaceSize[0], sh = surfaceSize[1];
+        if (sw != viewportWidth || sh != viewportHeight) {
+            GLES20.glViewport(0, 0, sw, sh);
+            viewportWidth = sw;
+            viewportHeight = sh;
+        }
         boolean exact = sw == width && sh == height;
         int filter = exact ? GLES20.GL_NEAREST : GLES20.GL_LINEAR;
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filter);
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filter);
+        if (textureFilter != filter) {
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filter);
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filter);
+            textureFilter = filter;
+        }
         if (front && dx1 > dx0) {
             // Only the changed area: less to tear, less to draw. One pixel of
             // margin covers the linear filter's reach.

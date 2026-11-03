@@ -285,6 +285,8 @@ For tile frames, `capture_avg_ms` includes damage processing, capture submission
 the X server reply wait and cursor composition; `diff_avg_ms` covers conversion
 and comparison; `encode_avg_ms` covers rectangle construction, compression and
 socket enqueue attempts. These describe emitted frames only. A socket may
-finish transmitting later, so enqueue timing is not wire time. Android's
-`adb logcat -s StylLinkVideo` reports the actual front/swap renderer and aggregate
-decode, upload and presentation-call CPU time.
+finish transmitting later, so enqueue timing is not wire time. Android diagnostics
+are off by default. Run `adb shell setprop log.tag.StylLinkVideo DEBUG`, reconnect
+the app, then use `adb logcat -s StylLinkVideo` for the actual front/swap renderer
+and aggregate decode, upload and presentation-call CPU time. To disable them, set
+the tag to `INFO` and reconnect.

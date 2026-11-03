@@ -50,6 +50,7 @@ fn command(b: *std.Build, name: []const u8, argv: []const []const u8) *std.Build
 
 fn sourceFiles(b: *std.Build, directory: []const u8, extension: ?[]const u8) []const []const u8 {
     const io = b.graph.io;
+    b.dependOnDirectoryContents(b.path(directory));
     var dir = b.root.openDir(io, directory, .{ .iterate = true }) catch |err|
         std.debug.panic("cannot open {s}: {t}", .{ directory, err });
     defer dir.close(io);
@@ -57,6 +58,10 @@ fn sourceFiles(b: *std.Build, directory: []const u8, extension: ?[]const u8) []c
     defer walker.deinit();
     var files: std.ArrayList([]const u8) = .empty;
     while (walker.next(io) catch |err| std.debug.panic("cannot read {s}: {t}", .{ directory, err })) |entry| {
+        if (entry.kind == .directory) {
+            b.dependOnDirectoryContents(b.path(b.pathJoin(&.{ directory, entry.path })));
+            continue;
+        }
         if (entry.kind != .file) continue;
         if (extension) |ext| {
             if (!std.mem.endsWith(u8, entry.path, ext)) continue;
