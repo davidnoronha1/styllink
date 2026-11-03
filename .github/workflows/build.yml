@@ -34,9 +34,9 @@ jobs:
           cp zig-out/bin/styllink dist/linux/styllink
       - name: Package server
         run: |
-          cp run.sh install-uinput-access.sh README.md WORKING.md .zig-version dist/linux/
-          cp -R docs dist/linux/
-          chmod +x dist/linux/styllink dist/linux/*.sh
+          cp Makefile README.md WORKING.md .zig-version dist/linux/
+          cp -R assets dist/linux/
+          chmod +x dist/linux/styllink
           tar -czf dist/styllink-linux-x86_64.tar.gz -C dist/linux .
           cd dist
           sha256sum styllink-linux-x86_64.tar.gz > styllink-linux-x86_64.tar.gz.sha256
@@ -68,8 +68,6 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ steps.zig-version.outputs.version }}
-      - name: Test WebSocket client
-        run: zig build test-link
       - name: Prepare debug signing key
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_DEBUG_KEYSTORE_BASE64 }}

@@ -1,7 +1,7 @@
 //! WebSocket and HTTP protocol handling, client socket management, and event pacing.
 
 const std = @import("std");
-const linux = std.os.linux;
+const platform = @import("platform.zig");
 const util = @import("util.zig");
 const config = @import("config.zig");
 const input = @import("input.zig");
@@ -21,7 +21,7 @@ pub const PING_EVERY = stats.PING_EVERY;
 pub const REPORT_EVERY = stats.REPORT_EVERY;
 
 pub const Client = struct {
-    fd: i32 = -1,
+    fd: platform.Handle = platform.invalid_handle,
     ws: bool = false,
     off: usize = 0,
     len: usize = 0,
@@ -31,18 +31,20 @@ pub const Client = struct {
 };
 
 pub var clients: [MAX_CLIENTS]Client = @splat(.{});
-pub var epfd: i32 = -1;
+pub var reactor: platform.Reactor = .{};
+var io: std.Io = undefined;
 pub var active_ws: usize = 0;
 pub var newest_ws: ?usize = null;
 pub var ticks: u64 = 0;
 pub var cfg: config.Config = .{};
 
-pub fn init(c: config.Config) void {
+pub fn init(c: config.Config, context: std.Io) void {
     cfg = c;
+    io = context;
 }
 
 pub fn closeClient(c: *Client) void {
-    if (c.fd == -1) { // handed to the video thread
+    if (c.fd == platform.invalid_handle) { // handed to the video thread
         c.* = .{};
         return;
     }
@@ -59,8 +61,8 @@ pub fn closeClient(c: *Client) void {
             newest_ws = null;
         };
     }
-    if (epfd != -1) _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, c.fd, null);
-    _ = linux.close(c.fd);
+    reactor.remove(c.fd);
+    platform.IO.close(io, c.fd);
     c.* = .{};
 }
 
@@ -75,16 +77,12 @@ pub fn sendFrame(c: *Client, opcode: u8, payload: []const u8) void {
         std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
         hl = 4;
     }
-    const iov = [_]std.posix.iovec_const{
-        .{ .base = &hdr, .len = hl },
-        .{ .base = payload.ptr, .len = payload.len },
-    };
-    _ = linux.writev(c.fd, &iov, 2);
+    _ = platform.IO.writeParts(io, c.fd, hdr[0..hl], payload) catch {};
 }
 
 pub fn sendPing(c: *Client, kind: u8) void {
     var b: [32]u8 = undefined;
-    const msg = std.fmt.bufPrint(&b, "{c}{d}", .{ kind, util.nowNs() }) catch return;
+    const msg = std.fmt.bufPrint(&b, "{c}{d}", .{ kind, util.nowNs(io) }) catch return;
     sendFrame(c, 0x1, msg);
 }
 
@@ -113,11 +111,7 @@ pub fn httpReply(c: *Client, status: []const u8, ctype: []const u8, body: []cons
     var hdr: [256]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\n" ++
         "Cache-Control: no-store\r\nConnection: close\r\n\r\n", .{ status, ctype, body.len }) catch return;
-    const iov = [_]std.posix.iovec_const{
-        .{ .base = h.ptr, .len = h.len },
-        .{ .base = body.ptr, .len = body.len },
-    };
-    _ = linux.writev(c.fd, &iov, 2);
+    _ = platform.IO.writeParts(io, c.fd, h, body) catch {};
 }
 
 /// Returns false if the client should be closed.
@@ -140,9 +134,9 @@ pub fn handleHttp(c: *Client) bool {
             httpReply(c, "400 Bad Request", "text/plain", "expected websocket\n");
             return false;
         };
-        if (cfg.token.len > 0) {
+        if (cfg.network.token.len > 0) {
             const t = queryParam(target, "t") orelse "";
-            if (!std.mem.eql(u8, t, cfg.token)) {
+            if (!std.mem.eql(u8, t, cfg.network.token)) {
                 httpReply(c, "403 Forbidden", "text/plain", "bad token\n");
                 stats.say("styllink: rejected {d}.{d}.{d}.{d}: wrong token\n", .{ c.peer[0], c.peer[1], c.peer[2], c.peer[3] });
                 return false;
@@ -159,13 +153,13 @@ pub fn handleHttp(c: *Client) bool {
         var resp: [256]u8 = undefined;
         const r = std.fmt.bufPrint(&resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n" ++
             "Connection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return false;
-        if (!util.writeAll(c.fd, r)) return false;
+        if (!platform.IO.writeAll(io, c.fd, r)) return false;
 
         if (is_video) {
             // The screen stream lives on its own thread and epoll loop.
-            _ = linux.epoll_ctl(epfd, linux.EPOLL.CTL_DEL, c.fd, null);
+            reactor.remove(c.fd);
             video.adopt(c.fd);
-            c.fd = -1;
+            c.fd = platform.invalid_handle;
             return false;
         }
 
@@ -175,7 +169,7 @@ pub fn handleHttp(c: *Client) bool {
         stats.say("styllink: {d}.{d}.{d}.{d} connected ({d} connected), benchmarking link...\n", .{ c.peer[0], c.peer[1], c.peer[2], c.peer[3], active_ws });
         stats.logJson("\"ev\":\"connect\",\"peer\":\"{f}\",\"origin\":{f}", .{ stats.ip(c.peer), std.json.fmt(headerValue(head, "Origin") orelse "", .{}) });
         var hello: [64]u8 = undefined;
-        const msg = std.fmt.bufPrint(&hello, "{{\"w\":{d},\"h\":{d}}}", .{ cfg.region[2], cfg.region[3] }) catch return false;
+        const msg = std.fmt.bufPrint(&hello, "{{\"w\":{d},\"h\":{d}}}", .{ cfg.display.region[2], cfg.display.region[3] }) catch return false;
         sendFrame(c, 0x1, msg);
 
         const rest = c.len - (c.off + end + 4);
@@ -249,8 +243,8 @@ pub fn handleWs(c: *Client) bool {
                 if (payload.len < 4) continue;
                 const excess = c.stats.uplink(std.mem.readInt(u32, payload[0..4], .little));
                 // When this message would have arrived with no network delay.
-                const arrival = util.nowNs();
-                const on_time = (arrival -| @as(u64, excess) * std.time.ns_per_us) + @as(u64, cfg.jitter_ms) * std.time.ns_per_ms;
+                const arrival = util.nowNs(io);
+                const on_time = (arrival -| @as(u64, excess) * std.time.ns_per_us) + @as(u64, cfg.input.jitter_ms) * std.time.ns_per_ms;
                 var active = false;
                 var i: usize = 4;
                 while (i + input.SAMPLE_SIZE <= payload.len) : (i += input.SAMPLE_SIZE) {
@@ -270,7 +264,7 @@ pub fn handleWs(c: *Client) bool {
             0x1 => if (payload.len > 0) switch (payload[0]) {
                 'p' => sendFrame(c, 0x1, payload), // page's own RTT ping: echo
                 'b', 's' => c.stats.pong(payload), // our ping coming back
-                'i' => stats.reportCaps(c.peer, &c.stats, payload, cfg.port), // page capabilities
+                'i' => stats.reportCaps(c.peer, &c.stats, payload, cfg.network.port), // page capabilities
                 else => {},
             },
             0x9 => sendFrame(c, 0xA, payload),
@@ -291,40 +285,28 @@ pub fn onData(c: *Client, n: usize) bool {
         // ACK the tablet's packets right away instead of Linux's delayed ACK
         // (up to 40 ms); a sender waiting on ACKs sends in bunches. The flag
         // isn't sticky, so it's re-armed after every read.
-        const one: i32 = 1;
-        _ = linux.setsockopt(c.fd, linux.IPPROTO.TCP, linux.TCP.QUICKACK, std.mem.asBytes(&one), 4);
+        platform.Network.quickAck(c.fd);
     }
     return if (c.ws) handleWs(c) else handleHttp(c);
 }
 
-pub fn tuneSocket(fd: i32) void {
-    const one: i32 = 1;
-    _ = linux.setsockopt(fd, linux.IPPROTO.TCP, linux.TCP.NODELAY, std.mem.asBytes(&one), 4);
-    // DSCP EF: on Wi-Fi (WMM) this maps our packets/ACKs to the voice queue.
-    const tos: i32 = 0xb8;
-    _ = linux.setsockopt(fd, linux.IPPROTO.IP, 1, std.mem.asBytes(&tos), 4); // IP_TOS
-    const buf_size: i32 = 65536;
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, std.mem.asBytes(&buf_size), 4);
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDBUF, std.mem.asBytes(&buf_size), 4);
-}
+pub const tuneSocket = platform.Network.tunePen;
 
-pub fn claimSlot(fd: i32) ?usize {
+pub fn claimSlot(fd: platform.Handle) ?usize {
     for (&clients, 0..) |*c, i| {
-        if (c.fd != -1) continue;
+        if (c.fd != platform.invalid_handle) continue;
         c.* = .{ .fd = fd };
-        var sa: linux.sockaddr.in = undefined;
-        var len: linux.socklen_t = @sizeOf(linux.sockaddr.in);
-        if (linux.errno(linux.getpeername(fd, @ptrCast(&sa), &len)) == .SUCCESS) c.peer = @bitCast(sa.addr);
+        c.peer = platform.Network.peer(fd);
         return i;
     }
-    _ = linux.close(fd); // full
+    platform.IO.close(io, fd); // full
     return null;
 }
 
 pub fn onTick() void {
     ticks += 1;
     for (&clients, 0..) |*c, i| {
-        if (c.fd == -1 or !c.ws) continue;
+        if (c.fd == platform.invalid_handle or !c.ws) continue;
         const st = &c.stats;
         if (st.burst_sent < BURST) {
             sendPing(c, 'b');
@@ -379,7 +361,12 @@ test "vectorized unmask matches byte-by-byte for all lengths" {
 
 test "handleWs zero-memmove cursor and compaction" {
     const testing = std.testing;
-    var client = Client{ .fd = -1, .ws = true };
+    var test_config: config.Config = .{};
+    test_config.input.uinput = false;
+    init(test_config, testing.io);
+    input.init(test_config, testing.io);
+    defer input.deinit();
+    var client = Client{ .fd = platform.invalid_handle, .ws = true };
 
     // Incomplete frame with lots of space remaining: off should not shift to 0
     client.off = 10;
@@ -405,4 +392,3 @@ test "handleWs zero-memmove cursor and compaction" {
     try testing.expectEqual(@as(usize, 0), client.off);
     try testing.expectEqual(@as(usize, 0), client.len);
 }
-

@@ -16,6 +16,7 @@ const Z_PIXMAP = 2;
 
 pub const Conn = struct {
     fd: i32 = -1,
+    io: std.Io = undefined,
     seq: u16 = 0,
     root: u32 = 0,
     root_w: u32 = 0,
@@ -28,6 +29,17 @@ pub const Conn = struct {
     damage_major: u8 = 0,
     damage_event: u8 = 0,
     damage: u32 = 0,
+    xfixes_major: u8 = 0,
+    xfixes_event: u8 = 0,
+    pointer_seq: ?u16 = null,
+    cursor_seq: ?u16 = null,
+    cursor_valid: bool = false,
+    cursor_serial: u32 = 0,
+    cursor_wanted_serial: ?u32 = null,
+    cursor_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    cursor_hot_x: i32 = 0,
+    cursor_hot_y: i32 = 0,
+    cursor_pixels: [256 * 256 * 4]u8 = undefined,
     shm_major: u8 = 0,
     shmseg: u32 = 0,
     shm: ?[]u8 = null,
@@ -44,15 +56,16 @@ pub const Conn = struct {
 
     // ------------------------------------------------------------ setup
 
-    pub fn open(self: *Conn, environ: std.process.Environ, in_buf: []u8) Error!void {
+    pub fn open(self: *Conn, io: std.Io, environ: std.process.Environ, in_buf: []u8) Error!void {
+        self.io = io;
         self.in = in_buf;
         const display = environ.getPosix("DISPLAY") orelse return error.NoDisplay;
         const num = displayNumber(display) orelse return error.NoDisplay;
-        self.fd = try connectUnix(num);
+        self.fd = try connectUnix(io, num);
         errdefer self.close();
 
         var cookie: [16]u8 = undefined;
-        const have_cookie = readCookie(environ, num, &cookie);
+        const have_cookie = readCookie(io, environ, num, &cookie);
         var hello: [12 + 20 + 16]u8 = @splat(0);
         hello[0] = 'l';
         std.mem.writeInt(u16, hello[2..4], 11, .little);
@@ -126,7 +139,7 @@ pub const Conn = struct {
             _ = linux.syscall1(.shmdt, @intFromPtr(m.ptr));
             self.shm = null;
         }
-        if (self.fd >= 0) _ = linux.close(self.fd);
+        if (self.fd >= 0) (std.Io.File{ .handle = self.fd, .flags = .{ .nonblocking = true } }).close(self.io);
         self.fd = -1;
         self.in_len = 0;
         self.in_off = 0;
@@ -150,6 +163,14 @@ pub const Conn = struct {
             std.mem.writeInt(u32, q[8..12], 0, .little);
             try self.send(&q);
             _ = try self.waitReply(self.seq, null);
+            self.xfixes_major = xfixes.major;
+            self.xfixes_event = xfixes.event + 1; // CursorNotify
+            var select: [12]u8 = undefined;
+            req(&select, xfixes.major, 3, 3); // SelectCursorInput
+            std.mem.writeInt(u32, select[4..8], self.root, .little);
+            std.mem.writeInt(u32, select[8..12], 1, .little);
+            try self.send(&select);
+            try self.requestCursor();
         }
         const dmg = try self.queryExtension("DAMAGE");
         if (!dmg.present) return error.NoDamage;
@@ -238,6 +259,56 @@ pub const Conn = struct {
 
     // ------------------------------------------------------------ capture
 
+    /// Poll only the pointer coordinates; cursor pixels are fetched on shape changes.
+    /// Both requests are asynchronous, so cursor updates never add a capture round trip.
+    pub fn pollCursor(self: *Conn) Error!void {
+        if (self.xfixes_major == 0 or self.pointer_seq != null) return;
+        var q: [8]u8 = undefined;
+        req(&q, 38, 0, 2); // QueryPointer
+        std.mem.writeInt(u32, q[4..8], self.root, .little);
+        try self.send(&q);
+        self.pointer_seq = self.seq;
+    }
+
+    fn requestCursor(self: *Conn) Error!void {
+        if (self.xfixes_major == 0 or self.cursor_seq != null) return;
+        var q: [4]u8 = undefined;
+        req(&q, self.xfixes_major, 4, 1); // GetCursorImage (premultiplied ARGB)
+        try self.send(&q);
+        self.cursor_seq = self.seq;
+    }
+
+    fn damageCursor(self: *Conn) void {
+        if (self.cursor_valid) if (self.on_damage) |f| f(self.ctx, self.cursor_rect);
+    }
+
+    fn cursorReply(self: *Conn, m: []const u8) void {
+        self.cursor_seq = null;
+        const w = std.mem.readInt(u16, m[12..14], .little);
+        const h = std.mem.readInt(u16, m[14..16], .little);
+        const size = @as(usize, w) * h * 4;
+        self.damageCursor();
+        self.cursor_valid = size <= self.cursor_pixels.len and size <= m.len - 32;
+        if (!self.cursor_valid) return;
+        self.cursor_hot_x = std.mem.readInt(u16, m[16..18], .little);
+        self.cursor_hot_y = std.mem.readInt(u16, m[18..20], .little);
+        self.cursor_serial = std.mem.readInt(u32, m[20..24], .little);
+        self.cursor_rect = .{
+            .x = @as(i32, std.mem.readInt(i16, m[8..10], .little)) - self.cursor_hot_x,
+            .y = @as(i32, std.mem.readInt(i16, m[10..12], .little)) - self.cursor_hot_y,
+            .w = w,
+            .h = h,
+        };
+        @memcpy(self.cursor_pixels[0..size], m[32..][0..size]);
+        self.damageCursor();
+    }
+
+    /// Composite the cached hardware cursor into a tightly packed BGRX capture.
+    pub fn compositeCursor(self: *const Conn, r: Rect, pixels: []u8) void {
+        if (!self.cursor_valid) return;
+        composite(r, pixels, self.cursor_rect, &self.cursor_pixels);
+    }
+
     /// Clears the accumulated damage; changes after this are reported again.
     pub fn subtractDamage(self: *Conn) Error!void {
         var s: [16]u8 = undefined;
@@ -323,8 +394,8 @@ pub const Conn = struct {
     /// Reads whatever has arrived without blocking and dispatches events.
     pub fn pump(self: *Conn) Error!void {
         while (true) {
-            if (try self.fill(false) == 0) return;
             _ = try self.dispatch(null, null);
+            if (try self.fill(false) == 0) return;
         }
     }
 
@@ -378,11 +449,35 @@ pub const Conn = struct {
             switch (m[0]) {
                 0 => { // error
                     self.last_error_seq = seq;
+                    if (self.pointer_seq != null and seq == self.pointer_seq.?) self.pointer_seq = null;
+                    if (self.cursor_seq != null and seq == self.cursor_seq.?) {
+                        self.cursor_seq = null;
+                        self.damageCursor();
+                        self.cursor_valid = false;
+                        self.xfixes_major = 0;
+                        self.xfixes_event = 0;
+                    }
                     if (want != null and seq == want.?) return false;
                     if (want == null or m[1] != 8) // BadMatch on a vanished rect is routine
                         std.debug.print("styllink: X error {d} (request {d}.{d})\n", .{ m[1], m[10], std.mem.readInt(u16, m[8..10], .little) });
                 },
-                1 => if (want != null and seq == want.?) {
+                1 => if (self.cursor_seq != null and seq == self.cursor_seq.?) {
+                    self.cursorReply(m[0..total]);
+                    if (self.cursor_wanted_serial) |serial| {
+                        if (serial != self.cursor_serial) try self.requestCursor();
+                        self.cursor_wanted_serial = null;
+                    }
+                } else if (self.pointer_seq != null and seq == self.pointer_seq.?) {
+                    self.pointer_seq = null;
+                    const x = @as(i32, std.mem.readInt(i16, m[16..18], .little)) - self.cursor_hot_x;
+                    const y = @as(i32, std.mem.readInt(i16, m[18..20], .little)) - self.cursor_hot_y;
+                    if (self.cursor_valid and (x != self.cursor_rect.x or y != self.cursor_rect.y)) {
+                        self.damageCursor();
+                        self.cursor_rect.x = x;
+                        self.cursor_rect.y = y;
+                        self.damageCursor();
+                    }
+                } else if (want != null and seq == want.?) {
                     if (out) |o| o.* = m[0..32].*;
                     if (self.image_dst) |dst| {
                         const data = m[32..total];
@@ -390,7 +485,13 @@ pub const Conn = struct {
                     }
                     return true;
                 },
-                else => if (kind == self.damage_event and self.damage_event != 0) {
+                else => if (kind == self.xfixes_event and self.xfixes_event != 0) {
+                    const serial = std.mem.readInt(u32, m[12..16], .little);
+                    if (serial != self.cursor_serial) {
+                        self.cursor_wanted_serial = serial;
+                        try self.requestCursor();
+                    }
+                } else if (kind == self.damage_event and self.damage_event != 0) {
                     if (self.on_damage) |f| f(self.ctx, .{
                         .x = std.mem.readInt(i16, m[16..18], .little),
                         .y = std.mem.readInt(i16, m[18..20], .little),
@@ -403,6 +504,46 @@ pub const Conn = struct {
         return null;
     }
 };
+
+fn composite(r: Rect, dst: []u8, cursor: Rect, src: []const u8) void {
+    const x0 = @max(r.x, cursor.x);
+    const y0 = @max(r.y, cursor.y);
+    const x1 = @min(r.x + @as(i32, @intCast(r.w)), cursor.x + @as(i32, @intCast(cursor.w)));
+    const y1 = @min(r.y + @as(i32, @intCast(r.h)), cursor.y + @as(i32, @intCast(cursor.h)));
+    if (x1 <= x0 or y1 <= y0) return;
+    var y = y0;
+    while (y < y1) : (y += 1) {
+        var x = x0;
+        while (x < x1) : (x += 1) {
+            const si = (@as(usize, @intCast(y - cursor.y)) * cursor.w + @as(usize, @intCast(x - cursor.x))) * 4;
+            const di = (@as(usize, @intCast(y - r.y)) * r.w + @as(usize, @intCast(x - r.x))) * 4;
+            const alpha: u32 = src[si + 3];
+            for (0..3) |c| dst[di + c] = @intCast(@min(255, @as(u32, src[si + c]) + (@as(u32, dst[di + c]) * (255 - alpha) + 127) / 255));
+        }
+    }
+}
+
+test "cursor request errors clear pending state and disable unsupported image capture" {
+    var messages: [64]u8 = @splat(0);
+    messages[1] = 3; // BadWindow
+    std.mem.writeInt(u16, messages[2..4], 7, .little);
+    messages[33] = 8; // BadMatch
+    std.mem.writeInt(u16, messages[34..36], 8, .little);
+    var conn = Conn{ .in = &messages, .in_len = messages.len, .pointer_seq = 7, .cursor_seq = 8, .xfixes_major = 140 };
+    try std.testing.expectEqual(@as(?bool, false), try conn.dispatch(7, null));
+    try std.testing.expectEqual(@as(?bool, false), try conn.dispatch(8, null));
+    try std.testing.expectEqual(@as(?u16, null), conn.pointer_seq);
+    try std.testing.expectEqual(@as(?u16, null), conn.cursor_seq);
+    try std.testing.expectEqual(@as(u8, 0), conn.xfixes_major);
+    try std.testing.expect(!conn.cursor_valid);
+}
+
+test "cursor composition clips hotspots and blends premultiplied alpha" {
+    var dst: [2 * 2 * 4]u8 = @splat(100);
+    const cursor = [_]u8{ 0, 0, 255, 255, 20, 30, 40, 128, 0, 0, 0, 0, 255, 255, 255, 255 };
+    composite(.{ .x = 10, .y = 20, .w = 2, .h = 2 }, &dst, .{ .x = 9, .y = 20, .w = 2, .h = 2 }, &cursor);
+    try std.testing.expectEqualSlices(u8, &.{ 70, 80, 90, 100, 100, 100, 100, 100, 255, 255, 255, 100, 100, 100, 100, 100 }, &dst);
+}
 
 fn pad4(n: usize) usize {
     return (n + 3) & ~@as(usize, 3);
@@ -441,31 +582,20 @@ pub fn displayNumber(d: []const u8) ?u32 {
     return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
 }
 
-fn connectUnix(num: u32) Error!i32 {
+fn connectUnix(io: std.Io, num: u32) Error!i32 {
     var path: [108]u8 = @splat(0);
-    const p = std.fmt.bufPrint(path[1..], "/tmp/.X11-unix/X{d}", .{num}) catch return error.Connect;
-    // Abstract socket first (what Xorg listens on), then the file.
-    for ([_]bool{ true, false }) |abstract| {
-        const fd_rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) return error.Connect;
-        const fd: i32 = @intCast(fd_rc);
-        var addr = linux.sockaddr.un{ .path = @splat(0) };
-        const len: usize = if (abstract) blk: {
-            @memcpy(addr.path[0 .. p.len + 1], path[0 .. p.len + 1]);
-            break :blk p.len + 1;
-        } else blk: {
-            @memcpy(addr.path[0..p.len], p);
-            break :blk p.len;
-        };
-        const sl: linux.socklen_t = @intCast(@sizeOf(linux.sa_family_t) + len);
-        if (linux.errno(linux.connect(fd, @ptrCast(&addr), sl)) == .SUCCESS) return fd;
-        _ = linux.close(fd);
+    const filesystem_path = std.fmt.bufPrint(path[1..], "/tmp/.X11-unix/X{d}", .{num}) catch return error.Connect;
+    // Xorg may expose an abstract socket, a filesystem socket, or both.
+    for ([_][]const u8{ path[0 .. filesystem_path.len + 1], filesystem_path }) |name| {
+        const address = std.Io.net.UnixAddress.init(name) catch continue;
+        const stream = address.connect(io) catch continue;
+        return stream.socket.handle;
     }
     return error.Connect;
 }
 
 /// MIT-MAGIC-COOKIE-1 for display `num` from $XAUTHORITY or ~/.Xauthority.
-fn readCookie(environ: std.process.Environ, num: u32, out: *[16]u8) bool {
+fn readCookie(io: std.Io, environ: std.process.Environ, num: u32, out: *[16]u8) bool {
     var pb: [512]u8 = undefined;
     const path = if (environ.getPosix("XAUTHORITY")) |x|
         std.fmt.bufPrintSentinel(&pb, "{s}", .{x}, 0) catch return false
@@ -473,17 +603,10 @@ fn readCookie(environ: std.process.Environ, num: u32, out: *[16]u8) bool {
         std.fmt.bufPrintSentinel(&pb, "{s}/.Xauthority", .{h}, 0) catch return false
     else
         return false;
-    const fd_rc = linux.open(path, .{ .CLOEXEC = true }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return false;
-    const fd: i32 = @intCast(fd_rc);
-    defer _ = linux.close(fd);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
     var buf: [16384]u8 = undefined;
-    var n: usize = 0;
-    while (n < buf.len) {
-        const rc = linux.read(fd, buf[n..].ptr, buf.len - n);
-        if (linux.errno(rc) != .SUCCESS or rc == 0) break;
-        n += rc;
-    }
+    const n = file.readPositionalAll(io, &buf, 0) catch return false;
     var numbuf: [10]u8 = undefined;
     const want = std.fmt.bufPrint(&numbuf, "{d}", .{num}) catch return false;
     return findCookie(buf[0..n], want, out);

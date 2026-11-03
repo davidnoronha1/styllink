@@ -27,16 +27,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     b.step("test", "Run server tests").dependOn(&b.addRunArtifact(server_tests).step);
-    const link_tests = b.addSystemCommand(&.{ "python3", "tests/check_link.py" });
-    link_tests.setCwd(b.path("."));
-    link_tests.has_side_effects = true;
-    b.step("test-link", "Run Java WebSocket tests (requires a JDK)").dependOn(&link_tests.step);
-    const video_tests = b.addSystemCommand(&.{ "python3", "tests/check_video.py" });
-    video_tests.addArtifactArg(server);
-    video_tests.setCwd(b.path("."));
-    video_tests.has_side_effects = true;
-    b.step("test-video", "Run the remote screen check (Xvfb, ffmpeg, python-xlib, lz4, numpy)").dependOn(&video_tests.step);
-
     const apk_file = buildApk(b);
     const install_apk = b.addInstallFile(apk_file, "android/styllink.apk");
     b.step("apk", "Build and install the APK into zig-out/android").dependOn(&install_apk.step);

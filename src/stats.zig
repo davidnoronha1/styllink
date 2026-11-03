@@ -1,7 +1,7 @@
 //! Link benchmark, latency statistics, stall diagnostics, and JSON logging.
 
 const std = @import("std");
-const linux = std.os.linux;
+const platform = @import("platform.zig");
 const util = @import("util.zig");
 
 pub const TICK_MS = 20;
@@ -12,22 +12,42 @@ pub const STALL_NS = 50 * std.time.ns_per_ms;
 
 pub var tty = false;
 pub var live_shown = false;
-pub var log_fd: i32 = -1;
+var io: std.Io = undefined;
+var log_file: ?std.Io.File = null;
+var log_offset: u64 = 0;
+var log_mutex: std.Io.Mutex = .init;
 
 pub fn initTty() void {
-    var termios: [64]u8 = undefined;
-    tty = linux.errno(linux.ioctl(2, 0x5401, @intFromPtr(&termios))) == .SUCCESS; // TCGETS on stderr
+    tty = std.Io.File.stderr().isTty(io) catch false;
 }
 
-pub fn initLog(path: [:0]const u8) void {
-    if (path.len > 0) {
-        const rc = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .CLOEXEC = true }, 0o644);
-        if (linux.errno(rc) == .SUCCESS) {
-            log_fd = @intCast(rc);
-        } else {
-            std.debug.print("styllink: can't open log {s}: {s}\n", .{ path, @tagName(linux.errno(rc)) });
-        }
-    }
+pub fn initLog(context: std.Io, path: [:0]const u8) void {
+    initLogAt(context, .cwd(), path);
+}
+
+fn initLogAt(context: std.Io, dir: std.Io.Dir, path: []const u8) void {
+    deinit();
+    io = context;
+    if (path.len == 0) return;
+    const file = dir.createFile(io, path, .{ .truncate = false }) catch |err| {
+        std.debug.print("styllink: can't open log {s}: {t}\n", .{ path, err });
+        return;
+    };
+    const stat = file.stat(io) catch {
+        file.close(io);
+        return;
+    };
+    log_offset = stat.size;
+    log_file = file;
+}
+
+pub fn loggingEnabled() bool {
+    return log_file != null;
+}
+
+pub fn deinit() void {
+    if (log_file) |file| file.close(io);
+    log_file = null;
 }
 
 /// Print a log line, first wiping the live status line if it is showing.
@@ -59,40 +79,20 @@ pub fn Ring(comptime N: usize) type {
     };
 }
 
-/// The bits of Linux `struct tcp_info` we report (offsets from linux/tcp.h).
-/// `ooo` (tcpi_rcv_ooopack) counts tablet->PC packets that arrived out of
-/// order because an earlier one was lost: TCP then holds back everything
-/// behind the hole until the retransmit, so pen data bunches up.
-pub const TcpInfo = struct {
-    rto_us: u32 = 0,
-    rtt_us: u32 = 0,
-    total_retrans: u32 = 0, // PC->tablet retransmits
-    segs_in: u32 = 0,
-    ooo: u32 = 0,
-};
-
-pub fn tcpInfo(fd: i32) ?TcpInfo {
-    var raw: [256]u8 align(8) = @splat(0);
-    var len: linux.socklen_t = raw.len;
-    if (linux.errno(linux.getsockopt(fd, linux.IPPROTO.TCP, linux.TCP.INFO, &raw, &len)) != .SUCCESS) return null;
-    if (len < 228) return null;
-    const r = struct {
-        fn u(b: *const [256]u8, off: usize) u32 {
-            return std.mem.readInt(u32, b[off..][0..4], .little);
-        }
-    }.u;
-    return .{ .rto_us = r(&raw, 8), .rtt_us = r(&raw, 68), .total_retrans = r(&raw, 100), .segs_in = r(&raw, 140), .ooo = r(&raw, 224) };
-}
+/// Optional OS TCP diagnostics, represented by portable counters.
+pub const TcpInfo = platform.types.TcpInfo;
+pub const tcpInfo = platform.Network.tcpInfo;
 
 /// Append one JSON object (`fields` without braces) with a unix-ms timestamp.
 pub fn logJson(comptime fields: []const u8, args: anytype) void {
-    if (log_fd < 0) return;
-    var b: [1024]u8 = undefined;
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
-    const unix_ms = @as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(ts.nsec)) / std.time.ns_per_ms;
-    const line = std.fmt.bufPrint(&b, "{{\"ts\":{d}," ++ fields ++ "}}\n", .{unix_ms} ++ args) catch return;
-    _ = util.writeAll(log_fd, line);
+    const file = log_file orelse return;
+    var buffer: [1024]u8 = undefined;
+    const unix_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const line = std.fmt.bufPrint(&buffer, "{{\"ts\":{d}," ++ fields ++ "}}\n", .{unix_ms} ++ args) catch return;
+    log_mutex.lockUncancelable(io);
+    defer log_mutex.unlock(io);
+    file.writePositionalAll(io, line, log_offset) catch return;
+    log_offset += line.len;
 }
 
 pub const Ip = struct {
@@ -147,8 +147,8 @@ pub const Stats = struct {
 
     /// A pen message arrived. While the pen is active the page sends one
     /// every few ms, so a long gap here means the network held data back.
-    pub fn arrival(st: *Stats, fd: i32, peer: [4]u8, active: bool, excess_us: u32) void {
-        const now = util.nowNs();
+    pub fn arrival(st: *Stats, fd: platform.Handle, peer: [4]u8, active: bool, excess_us: u32) void {
+        const now = util.nowNs(io);
         st.up_max = @max(st.up_max, excess_us);
         if (st.last_active and active and st.last_msg_ns != 0) {
             const gap = now - st.last_msg_ns;
@@ -159,8 +159,8 @@ pub const Stats = struct {
                 const t = tcpInfo(fd) orelse TcpInfo{};
                 const p = st.tcp_prev orelse t;
                 logJson("\"ev\":\"stall\",\"peer\":\"{f}\",\"gap_ms\":{f},\"uplink_excess_ms\":{f},\"ooo_since_stat\":{d},\"retrans_since_stat\":{d},\"tcp_rtt_ms\":{f}", .{
-                    ip(peer), ms(@intCast(@min(gap / 1000, std.math.maxInt(u32)))), ms(excess_us),
-                    t.ooo -% p.ooo, t.total_retrans -% p.total_retrans, ms(t.rtt_us),
+                    ip(peer),       ms(@intCast(@min(gap / 1000, std.math.maxInt(u32)))), ms(excess_us),
+                    t.ooo -% p.ooo, t.total_retrans -% p.total_retrans,                   ms(t.rtt_us),
                 });
             }
         }
@@ -170,7 +170,7 @@ pub const Stats = struct {
 
     pub fn pong(st: *Stats, payload: []const u8) void {
         const sent = std.fmt.parseInt(u64, payload[1..], 10) catch return;
-        const us: u32 = @intCast(@min((util.nowNs() -| sent) / 1000, std.math.maxInt(u32)));
+        const us: u32 = @intCast(@min((util.nowNs(io) -| sent) / 1000, std.math.maxInt(u32)));
         if (payload[0] == 'b') st.burst.push(us);
         st.rtt.push(us);
     }
@@ -180,7 +180,7 @@ pub const Stats = struct {
     /// anything: we report it relative to the best case seen recently.
     pub fn uplink(st: *Stats, t: u32) u32 {
         st.msgs += 1;
-        const here: u32 = @truncate(util.nowNs() / 100_000);
+        const here: u32 = @truncate(util.nowNs(io) / 100_000);
         const off = here -% t;
         const ref = st.up_ref orelse blk: {
             st.up_ref = off;
@@ -210,7 +210,7 @@ pub fn reportCaps(peer: [4]u8, st: *Stats, payload: []const u8, port: u16) void 
     st.caps_seen = true;
     if (native) return say("  pen input: Android app (unbuffered, full sample rate), low-latency Wi-Fi lock {s}\n", .{if (wifi_lock) "held" else "NOT held"});
     if (raw) return say("  pen input: raw events (lowest latency, full sample rate)\n", .{});
-    const me = util.lanAddr() orelse [4]u8{ 127, 0, 0, 1 };
+    const me = platform.Network.lanAddr(io) orelse [4]u8{ 127, 0, 0, 1 };
     if (coalesced) return say("  pen input: coalesced events (full sample rate, up to 1 frame extra latency)\n", .{});
     say(
         \\  WARNING: {d}.{d}.{d}.{d} opened the page from an insecure origin, so Chrome hides the
@@ -239,7 +239,7 @@ pub fn reportBurst(peer: [4]u8, st: *Stats) void {
         ip(peer), r.n, ms(r.pct(0)), ms(r.pct(50)), ms(p95), ms(r.pct(100)), ms(@intCast(jit)),
     });
     say("  link benchmark ({d}/{d} pings): rtt min {f}  p50 {f}  p95 {f}  max {f} ms, jitter {f} ms -> {s}\n", .{
-        r.n,           BURST,         ms(r.pct(0)),               ms(r.pct(50)), ms(p95), ms(r.pct(100)),
+        r.n,               BURST,   ms(r.pct(0)), ms(r.pct(50)), ms(p95), ms(r.pct(100)),
         ms(@intCast(jit)), verdict,
     });
 }
@@ -265,7 +265,7 @@ pub fn reportLive(st: *const Stats, ticks: u64) void {
 
 /// Once a second: one log line per client with this second's link stats
 /// (every 10 s while idle), then reset the per-second counters.
-pub fn logStat(fd: i32, peer: [4]u8, st: *Stats, ticks: u64, play_lag_max_ns: u64) void {
+pub fn logStat(fd: platform.Handle, peer: [4]u8, st: *Stats, ticks: u64, play_lag_max_ns: u64) void {
     const t = tcpInfo(fd) orelse TcpInfo{};
     const p = st.tcp_prev orelse t;
     st.tcp_prev = t;
@@ -273,13 +273,13 @@ pub fn logStat(fd: i32, peer: [4]u8, st: *Stats, ticks: u64, play_lag_max_ns: u6
         logJson("\"ev\":\"stat\",\"peer\":\"{f}\",\"pen_hz\":{d},\"msgs\":{d},\"gap_max_ms\":{f},\"stalls\":{d},\"burst_max\":{d}," ++
             "\"rtt_p50_ms\":{f},\"rtt_p95_ms\":{f},\"uplink_p50_ms\":{f},\"uplink_p95_ms\":{f},\"uplink_max_ms\":{f}," ++
             "\"ooo\":{d},\"retrans\":{d},\"segs_in\":{d},\"tcp_rtt_ms\":{f},\"tcp_rto_ms\":{f},\"smooth_lag_max_ms\":{f},\"age_mean_ms\":{f},\"age_max_ms\":{f}", .{
-            ip(peer),             st.samples,                      st.msgs,
-            ms(@intCast(@min(st.gap_max_ns / 1000, std.math.maxInt(u32)))), st.stalls, st.burst_max,
-            ms(st.rtt.pct(50)),     ms(st.rtt.pct(95)),              ms(st.up.pct(50)),
-            ms(st.up.pct(95)),      ms(st.up_max),                   t.ooo -% p.ooo,
-            t.total_retrans -% p.total_retrans, t.segs_in -% p.segs_in, ms(t.rtt_us),
-            ms(t.rto_us),                               ms(@intCast(@min(play_lag_max_ns / 1000, std.math.maxInt(u32)))),
-            ms(if (st.age_n > 0) @intCast(st.age_sum_us / st.age_n) else 0), ms(st.age_max_us),
+            ip(peer),                                                       st.samples,                                                       st.msgs,
+            ms(@intCast(@min(st.gap_max_ns / 1000, std.math.maxInt(u32)))), st.stalls,                                                        st.burst_max,
+            ms(st.rtt.pct(50)),                                             ms(st.rtt.pct(95)),                                               ms(st.up.pct(50)),
+            ms(st.up.pct(95)),                                              ms(st.up_max),                                                    t.ooo -% p.ooo,
+            t.total_retrans -% p.total_retrans,                             t.segs_in -% p.segs_in,                                           ms(t.rtt_us),
+            ms(t.rto_us),                                                   ms(@intCast(@min(play_lag_max_ns / 1000, std.math.maxInt(u32)))), ms(if (st.age_n > 0) @intCast(st.age_sum_us / st.age_n) else 0),
+            ms(st.age_max_us),
         });
     }
     st.age_max_us = 0;
@@ -289,4 +289,42 @@ pub fn logStat(fd: i32, peer: [4]u8, st: *Stats, ticks: u64, play_lag_max_ns: u6
     st.burst_max = 0;
     st.up_max = 0;
     st.stalls = 0;
+}
+
+test "JSON logging appends complete lines from both application threads" {
+    const context = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    initLogAt(context, temp.dir, "events.jsonl");
+    defer deinit();
+    try std.testing.expect(loggingEnabled());
+    const Worker = struct {
+        fn run(id: u8) void {
+            for (0..32) |n| logJson("\"ev\":\"test\",\"worker\":{d},\"n\":{d}", .{ id, n });
+        }
+    };
+    const a = try std.Thread.spawn(.{}, Worker.run, .{0});
+    const b = try std.Thread.spawn(.{}, Worker.run, .{1});
+    a.join();
+    b.join();
+    deinit();
+    // Reopening must append, preserving the previous session's diagnostics.
+    initLogAt(context, temp.dir, "events.jsonl");
+    logJson("\"ev\":\"reopened\"", .{});
+    deinit();
+    const file = try temp.dir.openFile(context, "events.jsonl", .{});
+    defer file.close(context);
+    var buffer: [16384]u8 = undefined;
+    const count = try file.readPositionalAll(context, &buffer, 0);
+    var lines = std.mem.tokenizeScalar(u8, buffer[0..count], '\n');
+    var line_count: usize = 0;
+    while (lines.next()) |line| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.object.get("ts") != null);
+        line_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 65), line_count);
+    initLogAt(context, temp.dir, "");
+    try std.testing.expect(!loggingEnabled());
 }
