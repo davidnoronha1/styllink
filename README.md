@@ -1,176 +1,113 @@
 # StylLink
 
-Use your Android tablet as a pen tablet for Linux, with the Android app or a browser.
+Use your Android tablet as a pen tablet for Linux. Draw on the tablet while you
+see the PC screen under the pen.
 
-Supports pressure, tilt, the pen button, and the eraser. Shows the PC screen
-under the pen, so you draw on the picture itself.
-Works through Wi-Fi or USB. Built with Zig, native Android views, and a browser client.
-
-**Website:** [styllink.vercel.app](https://styllink.vercel.app/) — use StylLink in
-Chrome without installing the Android APK. The Linux server still runs on your PC.
+- Use pen pressure, tilt, the pen button, and the eraser.
+- Connect through USB or Wi-Fi.
+- Use the Android app or the [website](https://styllink.vercel.app/).
 
 <img src="assets/demo.gif" alt="Drawing on the tablet and Linux PC" width="240">
 
-[How it works](WORKING.md)
-
-## Install
-
-Download: [Linux](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11963055735) · [Android APK](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11962136870) · [All builds](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml)
-
-Artifacts expire after 30 days. Open **All builds** for newer downloads.
-
-1. Extract the Linux ZIP, then extract its `.tar.gz` file.
-2. Run these commands on your PC:
-
-```sh
-make install-uinput-access   # Run once. Requires sudo.
-make run
+```mermaid
+flowchart LR
+    Tablet[Android app or browser] -->|Pen input| PC[Linux PC]
+    PC -->|PC screen| Tablet
 ```
 
-For the native Android client, extract the Android ZIP and install `styllink.apk`
-on your tablet. Browser users can skip the APK.
+## What you need
 
-The PC requires Make, Linux with uinput and libinput, and X11 for screen sharing.
-The native app requires Android 11 or later; the website uses Chrome with pen support.
-Tested with Ubuntu 22.04 and X11.
+- A Linux PC with Make and access to `/dev/uinput`.
+- An X11 desktop session for screen sharing. Tested with Ubuntu 22.04 and X11.
+- An Android tablet with a pen. The native app requires Android 11 or later.
+- For the website, use Chrome for the hosted connection. Firefox may block it.
+- For USB, install ADB on the PC and use a USB cable that transfers data.
 
-## Connect with the Android app
+## Start the server
 
-Open the app menu. Select **Open camera to scan QR**.
-Scan a QR code from the PC terminal, then open its link.
+Download the [Linux package](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11963055735)
+and, if required, the [Android APK](https://github.com/davidnoronha1/styllink/actions/runs/38715104674/artifacts/11962136870).
+Build downloads expire after 30 days. Use [All builds](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml)
+if a download has expired.
 
-- **USB:** Enable USB debugging and approve the PC. The server sets up
-  forwarding and shows the USB QR first. Requires ADB on the PC.
-- **Wi-Fi:** Connect both devices to the same network. Scan the Wi-Fi QR.
+1. Extract the Linux ZIP file. Then extract the `.tar.gz` file inside it.
+2. Open a terminal in the extracted folder.
+3. Configure pen input once. This command requires `sudo`:
 
-You can also enter the address and token from the terminal.
-To switch to USB, select **Use USB · localhost:8080**, then **Connect**.
-Keep the app open and the tablet unlocked.
+   ```sh
+   make install-uinput-access
+   ```
 
-The tablet shows the mapped monitor and the pen lands where you see it.
-The desktop mouse cursor appears in the stream too.
-The menu can turn the screen off, switch off front-buffer rendering
-if you see tearing, or prefer H.264 for video or weak Wi-Fi.
-Screen sharing requires an X11 session. Video settings adapt automatically.
+4. Start the server:
 
-The menu also has finger input and trail settings.
-Set **Trail fade** from 0.1 to 5 seconds.
+   ```sh
+   make run
+   ```
 
-## Use the website
+Keep the server running while you draw. Use a trusted network. The connection
+to the PC is not encrypted.
 
-[styllink.vercel.app](https://styllink.vercel.app/) is the browser client. It
-connects directly to the StylLink server on your PC for pen input and screen
-sharing. Keep the server running while you draw.
+## Connect the tablet
 
-### Wi-Fi
+### Use Wi-Fi
 
-1. Connect the PC and tablet to the same network, then start `make run` on the PC.
-2. On the tablet, open the complete **Browser (Chrome)** URL printed in the terminal.
-   It opens the website with the PC address and access token already filled in.
-3. Allow local-network access if Chrome asks, then wait for the connected status.
-   See [Chrome's local-network permission guide](https://developer.chrome.com/docs/modern-web-guidance/guides/security/local-network-access)
-   if access was previously blocked.
-4. Draw with the pen on the displayed PC screen. Keep the page visible and the
-   tablet unlocked.
+1. Connect the PC and tablet to the same network.
+2. Select one client:
+   - **Android app:** Install `styllink.apk`. Open the app menu. Select
+     **Open camera to scan QR**. Scan the Wi-Fi QR code in the PC terminal.
+   - **Website:** Open the complete **Browser (Chrome)** link from the PC terminal
+     on the tablet. Allow local-network access if the browser requests it.
+3. Wait for the connected status. Keep the app or page visible and the tablet unlocked.
+4. Draw on the image of the PC screen.
 
-The terminal QR codes open the native Android app. Use the **Browser (Chrome)**
-link for the website.
+### Use USB
 
-To connect manually, open the website and tap the top-right corner to reveal its
-menu. Enter the server's address in **PC address**, such as `192.168.1.20:8080`,
-and copy its token from the terminal's browser URL into **Token**. Press **Connect**.
-The address must point to your PC; opening the website alone does not start a server.
+1. Enable USB debugging on the tablet.
+2. Connect the USB cable. Approve the PC on the tablet.
+3. Run `make run` on the PC. Wait for the **USB ready** message.
+4. In the Android app, scan the USB QR code. For the website, open the USB browser
+   link from the terminal, such as `http://localhost:8080/?t=YOUR_TOKEN`.
 
-For example, a complete browser link looks like:
+In the Android app, you can also select **Use USB · localhost:8080**, then **Connect**.
+Use the port and token shown in your terminal.
 
-```text
-https://styllink.vercel.app/#h=192.168.1.20:8080&t=YOUR_TOKEN
-```
+### Change settings
 
-In the menu, **Show PC screen** controls screen sharing, **Finger drawing**
-enables touch input, and **Ink trail preview** shows a local pen trail.
-Use **Fullscreen** to hide browser controls. **Prefer H.264 screen** requests
-H.264 when the server uses the `auto` preset and the browser supports decoding it.
+- **Website:** Tap the top-right corner to open the menu.
+- **Android app:** Open the app menu.
+- Enter the PC address and token manually if you cannot use the link or QR code.
+- Use **Show PC screen** to control screen sharing in the website.
+- Use the finger input and ink trail settings as required.
+- Select **Prefer H.264** for video or a weak Wi-Fi connection.
 
-### USB and the local page
+## If the connection fails
 
-Enable USB debugging, approve the PC, and run `make run` with ADB installed.
-The launcher sets up USB forwarding automatically. On the tablet, open the
-terminal's **USB** browser address in Chrome, for example:
+- Check that the PC server is running.
+- Check the PC address, port, and token against the terminal output.
+- For Wi-Fi, check that both devices use the same network. Check that the PC
+  firewall permits the server port. The default port is `8080`.
+- For USB, check that ADB detects an approved tablet. Start `make run` again.
+- If Firefox cannot connect to the hosted page, try Chrome or the terminal's
+  **Local browser fallback** link. The local HTTP page can reduce pen sampling.
+- If pen input works but the PC screen is missing, check that the PC uses X11.
 
-```text
-http://localhost:8080/?t=YOUR_TOKEN
-```
+The website shows a notice when a connection fails or takes more than eight
+seconds. Select **Connection settings** to check the address and token.
+The notice clears when the connection succeeds.
 
-This serves the same browser client directly from the PC through USB forwarding.
-Replace the token and port with the values printed by your server.
+## Common commands
 
-The terminal also prints a **Local browser fallback** URL using the PC's LAN
-address. That HTTP page can have a lower pen sampling rate because full-rate pen
-APIs require a secure context. Prefer the hosted HTTPS page for Wi-Fi, or the
-`localhost` page for USB. If the hosted page cannot connect, check the PC address,
-server port, and Chrome's local-network permission.
-
-
-## Build
-
-Use the Zig version in [.zig-version](.zig-version):
-
-```sh
-make build                  # Static Linux binary: zig-out/bin/styllink.
-make test                   # Unit tests.
-make run                    # Builds and starts the server.
-```
-
-For Android, install JDK 21 or later and set `ANDROID_HOME` to your SDK path:
-
-```sh
-sdkmanager 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools'
-sdkmanager --licenses
-make apk               # Creates zig-out/android/styllink.apk.
-make apk-install       # Builds and installs through ADB.
-```
-
-[GitHub Actions](https://github.com/davidnoronha1/styllink/actions/workflows/build.yml) builds both packages on each push.
-Set `ANDROID_DEBUG_KEYSTORE_BASE64` to keep the CI signing key stable.
-A different key requires you to uninstall the old app before you install the new APK.
-
-## Options
-
-```sh
-make run ARGS="--port 9000"  # Use another port.
-MONITOR=HDMI-0 make run              # Select a monitor.
-MONITOR=STYLLINK make run            # Select an existing RandR logical monitor.
-STYLLINK_USB=0 make run              # Skip automatic USB setup.
-make run ARGS="--no-uinput"  # Test the link without desktop input.
-make run ARGS="--no-video"  # Pen only, no screen.
-make run ARGS="--preset fast"  # Reduce video bandwidth and queue depth.
-```
-
-Video presets are selected after the tablet reports its capabilities:
-
-| Preset | Preference |
+| Task | Command |
 | --- | --- |
-| `auto` (default) | Adapt to the connection and tablet; honor its H.264 preference. |
-| `quality` | Full-resolution tiles with true color where supported. |
-| `fast` | Half-resolution tiles, RGB565 where supported, one frame in flight. |
-| `h264` | H.264 through ffmpeg; fall back to tiles if unsupported. |
+| Select a monitor | `MONITOR=HDMI-0 make run` |
+| Change the port | `make run ARGS="--port 9000"` |
+| Use pen input without screen sharing | `make run ARGS="--no-video"` |
+| Reduce screen bandwidth | `make run ARGS="--preset fast"` |
+| Record a diagnostic log | `make run DEBUG=1` |
+| Show build and run commands | `make help` |
+| Show server options | `./styllink --help` |
 
-All presets use the tablet's refresh rate and supported formats. Tablet settings
-remain available; an explicit preset takes priority over the H.264 preference.
-
-Pass server options with `ARGS`, for example `make run ARGS="--port 9000"`.
-Use `make deploy-web` to deploy the browser page to Vercel.
-Run `make help` for available targets.
-
-Run `./styllink --help` for every option. See [the remote screen](WORKING.md#remote-screen-pc--tablet)
-for the streaming protocol.
-
-For an extended desktop on the tablet, see [second monitor setup](assets/second-monitor.md).
-
-USB gives the most stable connection. For wireless use, try Ethernet on the PC.
-JSON logging is off by default. Run `make run DEBUG=1` to record events in
-`styllink.log` if input stops or has delays. To choose another path, use
-`make run DEBUG=1 ARGS="--log /tmp/styllink.log"`.
-
-Use a trusted network. The connection is not encrypted.
+To build from source, use the Zig version in [.zig-version](.zig-version), then
+run `make build`. See [WORKING.md](WORKING.md) for the Android build, screen
+presets, protocols, and technical details. For an extended desktop, use the
+[second monitor instructions](assets/second-monitor.md).

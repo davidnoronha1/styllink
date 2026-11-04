@@ -21,9 +21,20 @@
   }
   canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
   #screen { inset: auto; image-rendering: pixelated; pointer-events: none; }
+  #connectionNotice {
+    position: fixed; z-index: 1; bottom: max(16px, env(safe-area-inset-bottom)); left: 50%;
+    transform: translateX(-50%); width: min(480px, calc(100% - 32px)); padding: 16px;
+    border: 1px solid var(--bad); border-radius: 12px; background: #1c2128f5;
+    box-shadow: 0 8px 24px #0008; touch-action: manipulation;
+  }
+  #connectionNotice p { margin: 8px 0 12px; }
+  #connectionNotice button {
+    padding: 10px; border-radius: 8px; border: 1px solid var(--edge);
+    background: #2d333b; color: var(--fg); font: inherit;
+  }
 
   /* Invisible top-right hot corner; hover (mouse/pen) or tap unfolds the panel. */
-  #hud { position: fixed; top: 0; right: 0; display: flex; flex-direction: column; align-items: flex-end; }
+  #hud { position: fixed; z-index: 2; top: 0; right: 0; display: flex; flex-direction: column; align-items: flex-end; }
   #corner { width: 48px; height: 48px; }
   #panel {
     display: none; flex-direction: column; gap: 12px; width: 260px; margin: 0 8px 8px 0; padding: 14px;
@@ -50,6 +61,11 @@
 <body>
 <canvas id="screen" hidden></canvas>
 <canvas id="pad"></canvas>
+<div id="connectionNotice" role="status" aria-live="polite" hidden>
+  <strong id="connectionTitle"></strong>
+  <p id="connectionHelp"></p>
+  <button id="btnConnectionSettings" type="button">Connection settings</button>
+</div>
 <div id="hud">
   <div id="corner"></div>
   <div id="panel">
@@ -180,8 +196,9 @@ $("connForm").onsubmit = (e) => {
   conn.host = $("connHost").value.trim().replace(/^\w+:\/\//, "").replace(/\/.*$/, "");
   conn.token = $("connToken").value.trim();
   try { localStorage.setItem("styllink-conn", JSON.stringify(conn)); } catch {}
-  if (ws) { ws.onclose = null; ws.close(); ws = null; }
-  retry = 300; connect(); restartScreen();
+  clearTimeout(reconnectTimer); clearTimeout(connectionTimer);
+  if (ws) { ws.onopen = ws.onerror = ws.onclose = ws.onmessage = null; ws.close(); ws = null; }
+  rtt = null; retry = 300; connect(); restartScreen();
 };
 // Use the form values so opening the app also works before pressing Connect.
 $("btnAndroid").hidden = !/Android/i.test(navigator.userAgent);
@@ -191,16 +208,53 @@ $("btnAndroid").onclick = () => {
   const query = new URLSearchParams({ h, t: $("connToken").value.trim() });
   location.href = `styllink://connect?${query}`;
 };
-let ws = null, rtt = null, retry = 300;
+let ws = null, rtt = null, retry = 300, reconnectTimer = 0, connectionTimer = 0;
 const online = () => ws && ws.readyState === 1;
+$("btnConnectionSettings").onclick = () => {
+  pinned = true; setOpen(true); $("connHost").focus();
+};
+function connectionNotice(failed = false, blocked = false) {
+  const notice = $("connectionNotice");
+  notice.hidden = !!online() || (!!conn.host && !failed);
+  if (notice.hidden) return;
+  $("connectionTitle").textContent = !conn.host ? "Connect to your PC" : "Unable to connect to your PC";
+  let help = !conn.host
+    ? "Open the complete browser link printed by StylLink on your PC, or enter the PC address and token in Connection settings."
+    : "Keep StylLink running on your PC. Check the PC address and token, use the same Wi-Fi network, and check that the firewall allows the server port. Retrying automatically.";
+  // WebSocket failures do not reveal their cause. Offer browser guidance as a
+  // possibility instead of claiming every failure is a security restriction.
+  if (conn.host && location.protocol === "https:") {
+    if (/Firefox\//i.test(navigator.userAgent)) {
+      help += " Firefox may block this HTTPS page from connecting to your PC's unencrypted WebSocket. Try the complete link in Chrome and allow local-network access, or use the Local browser fallback / USB localhost link printed in the terminal. The local HTTP page may have a lower pen sampling rate.";
+    } else {
+      help += " Allow local-network access if your browser requests it. If the connection is blocked, try the Local browser fallback or USB localhost link printed in the terminal.";
+    }
+  }
+  if (blocked) help += " The browser rejected the connection address or blocked the request. Check the address in Connection settings.";
+  $("connectionHelp").textContent = help;
+}
+function retryConnection() {
+  clearTimeout(connectionTimer);
+  ws = null; rtt = null; status(); connectionNotice(true);
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connect, retry);
+  retry = Math.min(retry * 2, 3000);
+}
 function connect() {
-  if (!conn.host) { status(); pinned = true; setOpen(true); return; }   // ask for the address
+  if (!conn.host) { status(); connectionNotice(); pinned = true; setOpen(true); return; }
   // Plain ws:// even from an https page: Chrome still allows it to LAN
   // addresses (after a "local network access" prompt); the server has no TLS.
   try { ws = new WebSocket(`ws://${conn.host}/ws?t=${encodeURIComponent(conn.token)}`); }
-  catch { ws = null; status(); return; }
+  catch { retryConnection(); connectionNotice(true, true); return; }
+  const socket = ws;
+  connectionTimer = setTimeout(() => {
+    if (ws !== socket || online()) return;
+    connectionNotice(true);
+    socket.close();
+  }, 8000);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { retry = 300; status(); sendCaps(); };
+  ws.onopen = () => { clearTimeout(connectionTimer); retry = 300; status(); connectionNotice(); sendCaps(); };
+  ws.onerror = () => { if (ws === socket) connectionNotice(true); };
   ws.onmessage = (m) => {
     const d = m.data;
     if (typeof d !== "string") return;
@@ -209,7 +263,7 @@ function connect() {
     else if (k === "p") { rtt = performance.now() - parseFloat(d.slice(1)); status(); }
     else if (k === "{") { const h = JSON.parse(d); aspect = h.w / h.h; layout(); }
   };
-  ws.onclose = () => { ws = null; rtt = null; status(); setTimeout(connect, retry); retry = Math.min(retry * 2, 3000); };
+  ws.onclose = () => { if (ws === socket) retryConnection(); };
 }
 function status() {
   $("dot").classList.toggle("ok", !!online());
@@ -227,7 +281,6 @@ let lastSend = 0;
 setInterval(() => {
   if (opts.awake && online() && performance.now() - lastSend > 45) { ws.send("k"); lastSend = performance.now(); }
 }, 50);
-connect();
 
 // ---------------------------------------------------------------- PC screen
 // A second socket, /video. We tell the server what we can show; it answers
@@ -507,6 +560,7 @@ function frame() {
   requestAnimationFrame(frame);
 }
 layout();
+connect();
 requestAnimationFrame(frame);
 </script>
 </body>
